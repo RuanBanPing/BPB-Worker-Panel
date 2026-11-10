@@ -14,3 +14,105 @@
     "tweetnacl": "^1.0.3"
   }
 }
+<#
+.SYNOPSIS
+   Batch configure Lenovo server BIOS settings via OneCli bath mode.
+#>
+
+$OneCliPath = "C:\lnvgy_utl_lxce_onecli01v-5.5.0\OneCli.exe"
+$IPFile = "C:\Users\L10520018\Desktop\lushi\20261101\ip_list.txt"
+$Bmc_User = "USERID"
+$Bmc_Passwd = "frLjwc15yd#"
+$OutPutDir = "C:\Users\L10520018\Desktop\lushi\20261101"
+
+if (-not (Test-Path $IPFile)) {
+   Writ-Error " IP list file not found. "
+   exit 1
+   }
+$rawLines = Get-Content $IPFILE | Where-Object { $_ -match '\S' }
+$serverList = @()
+foreach($line in $rawLines){
+    $parts = $line.Trim() -split '\s+'
+    $obj = [PSCustomObject]@{
+        HostName = $parts[0]
+        BmcIp    = $parts[1]
+    }
+    $serverList += $obj
+}
+
+$skipIps = @()
+
+Write-Host "`n==============================" -ForegroundColor Cyan
+Write-Host "Total servers loaded: $($serverList.Count)" -ForegroundColor Cyan
+$serverList | ForEach-Object { Write-Host " - $($_.HostName) -> $($_.BmcIp)" }
+Write-Host "==============================" -ForegroundColor Cyan
+Write-Host "Press Enter to start [Task1: Configure BMC for all hosts]" -ForegroundColor Yellow
+Read-Host
+
+
+
+Write-Host "`n########## Task7/8: Parallel Restart BMC (With Timeout) ##########" -ForegroundColor Magenta
+
+$runningJobs = @()
+$TimeoutSeconds = 600 # 設定超時時間為 30 秒（發送重啟指令通常只需 5-10 秒）
+
+foreach ($srv in $serverList) {
+    $HostName = $srv.HostName
+    $BmcIp = $srv.BmcIp
+    if ($skipIps -contains $BmcIp) {
+        Write-Host "`n[$HostName][$BmcIp] Marked as skip" -ForegroundColor Gray
+        continue
+    }
+    $timestamp = Get-Date -Format "yyMMdd_HHmmss"
+    $runLogFile = Join-Path $OutPutDir "$HostName`_runlog_$timestamp.log"
+    $bmcConnStr = "${Bmc_User}:${Bmc_Passwd}@${BmcIp}"
+
+    Write-Host "[$HostName][$BmcIp] 正在背景啟動並行重啟任務..." -ForegroundColor Yellow
+    
+    # 啟動背景工作
+    $job = Start-Job -ScriptBlock {
+        param($oneCli, $connStr, $logFile)
+        & "$oneCli" misc rebootbmc --bmc "$connStr" 2>&1 | Tee-Object -FilePath $logFile -Append
+    } -ArgumentList $OneCliPath, $bmcConnStr, $runLogFile
+    
+    $runningJobs += [PSCustomObject]@{
+        HostName = $HostName
+        BmcIp    = $BmcIp
+        Job      = $job
+    }
+}
+
+Write-Host "`n>>>>>> 所有重啟指令已在背景發送，等待傳輸完成（最大限制 $TimeoutSeconds 秒）..." -ForegroundColor Cyan
+
+# 💡 核心修改：加上 -Timeout 參數，時間到了一定會放行
+$null = Wait-Job -Job $runningJobs.Job -Timeout $TimeoutSeconds
+
+Write-Host "`n########## 重啟指令發送結果總結 ##########" -ForegroundColor Magenta
+foreach ($item in $runningJobs) {
+    $jobState = $item.Job.State
+    
+    # 情況 1：任務仍在執行，代表超時卡住了
+    if ($jobState -eq "Running") {
+        Write-Host "[$($item.HostName)][$($item.BmcIp)] [超時] 指令發送卡住超過 $TimeoutSeconds 秒！強制終止。" -ForegroundColor Red
+        # 強行終止背景任務，釋放系統資源
+        Stop-Job -Job $item.Job
+        $skipIps += $item.BmcIp 
+    } 
+    # 情況 2：任務自己失敗了
+    elseif ($jobState -eq "Failed") {
+        Write-Host "[$($item.HostName)][$($item.BmcIp)] [失敗] 背景進程異常中斷！" -ForegroundColor Red
+        $skipIps += $item.BmcIp
+    } 
+    # 情況 3：順利完成
+    else {
+        # 接收剩餘輸出並清理
+        $null = Receive-Job -Job $item.Job
+        Write-Host "[$($item.HostName)][$($item.BmcIp)] [成功] 重啟指令已成功送達晶片。" -ForegroundColor Green
+    }
+    
+    # 徹底移除記憶體中的 Job 遺留
+    Remove-Job -Job $item.Job
+}
+
+Write-Host "`n>>>>>> 背景任務清理完畢！" -ForegroundColor Magenta
+Write-Host ">>>>>> BMC 重新開機完成。" -ForegroundColor Yellow
