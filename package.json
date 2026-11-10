@@ -14,3 +14,387 @@
     "tweetnacl": "^1.0.3"
   }
 }
+# -*- coding: utf-8 -*-
+import os
+import sys
+import time
+import socket
+import re
+import platform
+import subprocess
+import signal
+import threading
+from threading import Thread
+from flask import Flask, render_template_string, jsonify, request
+
+app = Flask(__name__)
+
+ping_threads = {}
+ping_status = {}
+result_lock = threading.Lock()
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>网络探测控制台</title>
+    <style>
+        :root { --primary: #1890ff; --success: #52c41a; --danger: #ff4d4f; --bg: #f7f9fa; --card-bg: #fff; --text: #262626; --border: #f0f0f0; }
+        body { font-family: 'Segoe UI', -apple-system, sans-serif; margin: 0; padding: 24px; background: var(--bg); color: var(--text); }
+        .dashboard { width: 85%; margin: 0 auto; display: grid; grid-template-columns: 360px 1fr; gap: 20px; box-sizing: border-box; }
+        .card { background: var(--card-bg); border-radius: 8px; border: 1px solid #e8e8e8; padding: 24px; display: flex; flex-direction: column; box-sizing: border-box; }
+        h2 { margin: 0 0 16px 0; font-size: 18px; color: #000; display: flex; align-items: center; gap: 8px; }
+        .title-border { width: 4px; height: 16px; background: var(--primary); border-radius: 2px; display: inline-block; }
+        .mode-selector { display: flex; background: #f0f2f5; padding: 3px; border-radius: 6px; margin-bottom: 16px; }
+        .mode-tab { flex: 1; text-align: center; padding: 6px; font-size: 13px; font-weight: 600; cursor: pointer; border-radius: 4px; transition: all 0.2s; color: #595959; }
+        .mode-tab.active { background: var(--card-bg); color: var(--primary); box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .btn-group { display: flex; gap: 10px; margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+        button { flex: 1; padding: 12px; border: none; border-radius: 6px; font-size: 14px; font-weight: bold; cursor: pointer; transition: all 0.2s; }
+        .btn-start { background: var(--primary); color: white; box-shadow: 0 2px 4px rgba(24,144,255,0.2); }
+        .btn-start:hover { background: #40a9ff; }
+        .btn-stop { background: #f5f5f5; color: #595959; border: 1px solid #d9d9d9; }
+        .btn-stop:hover { background: #e8e8e8; }
+        .form-group { margin-bottom: 16px; display: flex; flex-direction: column; flex: 1; }
+        .form-group label { font-size: 13px; font-weight: 600; margin-bottom: 8px; color: #595959; }
+        textarea { width: 100%; height: 500px; padding: 12px; box-sizing: border-box; border: 1px solid #d9d9d9; border-radius: 6px; font-family: monospace; font-size: 14px; resize: none; transition: all 0.3s; flex: 1; }
+        textarea:focus, input:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px rgba(24,144,255,0.2); }
+        #portGroup { display: none; flex: none; margin-bottom: 16px; }
+        input[type="text"] { width: 100%; padding: 10px 12px; box-sizing: border-box; border: 1px solid #d9d9d9; border-radius: 6px; font-size: 14px; }
+        .result-panel { min-height: 750px; }
+        .console-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-size: 13px; color: #8c8c8c; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
+        
+        .summary-badges { display: flex; gap: 12px; align-items: center; }
+        .stat-badge { padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; min-width: 75px; justify-content: center; }
+        .stat-badge b { font-size: 14px; margin-left: 2px; }
+        .stat-total { background: #f5f5f5; color: #595959; }
+        .stat-up { background: #e6f7ff; color: #096dd9; }
+        .stat-down { background: #fff1f0; color: #cf1322; }
+        
+        .console-body { flex: 1; background: #fff; border: 1px solid #d9d9d9; border-radius: 6px; padding: 10px; overflow-y: auto; height: 650px; font-family: 'Consolas', monospace; font-size: 13px; color: var(--text); }
+        .log-item { padding: 4px 10px; border-radius: 4px; margin-bottom: 4px; line-height: 1.3; display: flex; align-items: center; justify-content: space-between; border: 1px solid var(--border); }
+        .status-badge { padding: 1px 8px; border-radius: 3px; font-weight: bold; font-size: 11px; letter-spacing: 0.5px; }
+        .loss-badge { font-weight: 600; color: #595959; margin-left: auto; margin-right: 15px; font-size: 12px; }
+        .state-online { background: #f6ffed; border-color: #e6f4ea; color: #277e00; }
+        .state-online .status-badge { background: var(--success); color: white; }
+        .state-offline { background: #fff1f0; border-color: #fadbd8; color: #c0111f; }
+        .state-offline .status-badge { background: var(--danger); color: white; }
+        .state-offline .loss-badge { color: var(--danger); }
+        .state-info { background: #e6f7ff; border-color: #91d5ff; color: #096dd9; }
+    </style>
+</head>
+<body>
+<div class="dashboard">
+    <div class="card">
+        <h2><span class="title-border"></span>配置面板</h2>
+        <div class="mode-selector">
+            <div class="mode-tab active" id="tabPing" onclick="switchMode('ping')">批量长 Ping</div>
+            <div class="mode-tab" id="tabTelnet" onclick="switchMode('telnet')">批量 Telnet</div>
+        </div>
+        <div class="btn-group">
+            <button class="btn-start" onclick="executeAnalysis()">开始检测</button>
+            <button class="btn-stop" onclick="terminateAnalysis()">停止</button>
+        </div>
+        <div class="form-group" id="portGroup">
+            <label>自定义检测端口</label>
+            <input type="text" id="targetPort" value="80">
+        </div>
+        <div class="form-group">
+            <label id="hostsLabel">目标主机列表 (自动过滤端口)</label>
+            <textarea id="targetHosts" placeholder="10.129.196.25&#10;baidu.com:80"></textarea>
+        </div>
+    </div>
+    <div class="card result-panel">
+        <div class="console-header">
+            <div style="display: flex; flex-direction: column; gap: 4px;">
+                <span id="currentStatusText" style="font-weight: 600; color: #434343; font-size: 14px;">当前状态: 闲置中</span>
+                <span id="timestampView">系统就绪</span>
+            </div>
+            <div class="summary-badges" id="summaryPanel" style="display: none;">
+                <span class="stat-badge stat-total">总计: <b id="cntTotal">0</b></span>
+                <span class="stat-badge stat-up">🟢 在线: <b id="cntUp">0</b></span>
+                <span class="stat-badge stat-down">🔴 离线: <b id="cntDown">0</b></span>
+            </div>
+        </div>
+        <div class="console-body" id="consoleOutput">等待检测任务启动...</div>
+    </div>
+</div>
+<script>
+    let activeMode = 'ping', dataInterval = null;
+
+    window.onbeforeunload = () => navigator.sendBeacon('/api/exit_now'); 
+
+    function switchMode(mode) {
+        activeMode = mode;
+        document.getElementById('tabPing').classList.toggle('active', mode === 'ping');
+        document.getElementById('tabTelnet').classList.toggle('active', mode === 'telnet');
+        document.getElementById('portGroup').style.display = mode === 'telnet' ? 'block' : 'none';
+        document.getElementById('hostsLabel').innerText = mode === 'ping' ? '目标主机列表 (自动过滤端口)' : '目标主机列表 (支持独立指定端口)';
+    }
+
+    function renderLogs(items, isTelnet = false) {
+        let total = 0, up = 0, down = 0, html = '';
+        items.forEach(item => {
+            if (!item) return;
+            total++;
+            
+            const isUp = item.status === true && !String(item.detail || '').includes('正在握手');
+            isUp ? up++ : down++;
+            
+            const stateClass = isUp ? 'state-online' : 'state-offline';
+            const infoText = isTelnet ? `🔌 端口: <b>${item.host}:${item.port}</b> —— [反馈: ${item.msg}]` : `🌐 目标: <b>${item.host}</b> —— ${item.detail}`;
+            const extraBadge = isTelnet ? '-' : `发送: ${item.sent_count ?? 0} 次 | 失败: ${item.loss_count ?? 0} 次`;
+            
+            html += `
+                <div class="log-item ${stateClass}">
+                    <span>${infoText}</span>
+                    <span class="loss-badge">${extraBadge}</span>
+                    <span class="status-badge">${isUp ? 'UP' : 'DOWN'}</span>
+                </div>`;
+        });
+        document.getElementById('consoleOutput').innerHTML = html || (isTelnet ? '' : '<div class="log-item state-info">正在解析网络包回显...</div>');
+        document.getElementById('summaryPanel').style.display = 'flex';
+        document.getElementById('cntTotal').innerText = total;
+        document.getElementById('cntUp').innerText = up;
+        document.getElementById('cntDown').innerText = down;
+    }
+
+    async function executeAnalysis() {
+        if (dataInterval) clearInterval(dataInterval);
+        const hostsText = document.getElementById('targetHosts').value.trim();
+        if (!hostsText) return alert('请输入目标地址！');
+        
+        const hostList = hostsText.split(/\\r?\\n/).map(h => h.trim()).filter(h => h.length > 0);
+        document.getElementById('consoleOutput').innerHTML = '<div class="log-item state-info">正在建立探测信道，正在初始化底层 network 栈...</div>';
+        document.getElementById('currentStatusText').innerText = `当前状态: 正在检测 (${activeMode.toUpperCase()})`;
+        document.getElementById('timestampView').innerText = `任务启动时间: ${new Date().toLocaleTimeString()}`;
+
+        if (activeMode === 'ping') {
+            try {
+                await fetch('/api/ping/start', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ hosts: hostList })
+                });
+                dataInterval = setInterval(async () => {
+                    try {
+                        const res = await fetch('/api/ping/status');
+                        const data = await res.json();
+                        renderLogs(hostList.map(h => data[h] ? { host: h, ...data[h] } : null));
+                    } catch(e) {}
+                }, 1000);
+            } catch(e) { document.getElementById('consoleOutput').innerHTML = `<div class="log-item state-offline">发起请求失败: ${e}</div>`; }
+        } else {
+            try {
+                const portStr = document.getElementById('targetPort').value.trim();
+                const res = await fetch('/api/telnet', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ hosts: hostList, port: parseInt(portStr) })
+                });
+                const results = await res.json();
+                renderLogs(hostList.map(rawHost => results.find(r => rawHost.includes(r.host))), true);
+                document.getElementById('currentStatusText').innerText = "当前状态: 检测完成 (Telnet)";
+            } catch(e) { document.getElementById('consoleOutput').innerHTML = `<div class="log-item state-offline">探测失败: ${e}</div>`; }
+        }
+    }
+
+    function terminateAnalysis() {
+        if (dataInterval) clearInterval(dataInterval);
+        document.getElementById('currentStatusText').innerText = "当前状态: 已手动停止";
+        document.getElementById('consoleOutput').innerHTML = '<div class="log-item state-info">任务已中止。所有的探测进程已被后台回收释放。</div>';
+        fetch('/api/ping/stop', { method: 'POST' }).catch(() => {});
+    }
+</script>
+</body>
+</html>
+"""
+# --- 后端数据处理基础设施 ---
+
+def strict_clean_host(raw_str):
+    """提取纯IP/域名"""
+    s = re.sub(r'^https?://', '', raw_str.strip(), flags=re.IGNORECASE)
+    match = re.match(r'^([^:/\\\s]+)', s)
+    return match.group(1).strip() if match else s
+
+def ping_worker(original_host, target_ip):
+    """终极主动式时钟级长 Ping 处理器"""
+    is_win = platform.system().lower() == 'windows'
+    
+    # 初始化全局探测状态字典
+    ping_status[original_host] = {
+        "status": False, 
+        "detail": "正在握手连接...", 
+        "sent_count": 0,
+        "loss_count": 0
+    }
+    
+    # 注册一个标记，用于在外部发出 stop 指令时优雅安全地退出当前子线程
+    ping_threads[original_host] = True
+    t_reg = re.compile(r'time[=<](\d+\.?\d*\s*\w*)', re.I)
+    
+    # 核心：采用高频主动独立探针机制，不依赖长时间维持的长连接管道输出
+    while original_host in ping_threads:
+        # 单次按系统平台各发送1个包，超时设为0.8秒，快速收敛
+        if is_win:
+            cmd = ["ping", target_ip, "-n", "1", "-w", "800"]
+        else:
+            cmd = ["ping", target_ip, "-c", "1", "-W", "1"]
+            
+        try:
+            # 增加发送计数
+            with result_lock:
+                ping_status[original_host]["sent_count"] += 1
+                
+            start_t = time.time()
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=is_win)
+            out, _ = p.communicate()
+            encoding = 'gbk' if is_win else 'utf-8'
+            
+            try: res_str = out.decode(encoding).lower()
+            except: res_str = out.decode('utf-8', errors='ignore').lower()
+            
+            with result_lock:
+                stat = ping_status[original_host]
+                if p.returncode == 0 and "ttl=" in res_str:
+                    m = t_reg.search(res_str)
+                    stat.update({
+                        "status": True,
+                        "detail": f"响应正常 (延迟: {m.group(1)})" if m else "网络通畅"
+                    })
+                else:
+                    # 探测失败，失败数加 1
+                    stat["status"] = False
+                    stat["loss_count"] += 1
+                    if any(k in res_str for k in ["timeout", "超时", "timed out"]):
+                        stat["detail"] = "请求超时 (Request timed out...)"
+                    elif any(k in res_str for k in ["unreachable", "不可达"]):
+                        stat["detail"] = "目标主机不可达 (Host unreachable)"
+                    else:
+                        stat["detail"] = "请求超时 (Request timed out...)"
+        except Exception as e:
+            with result_lock:
+                stat = ping_status[original_host]
+                stat["status"] = False
+                stat["loss_count"] += 1
+                stat["detail"] = f"请求超时 (Request timed out...)"
+                
+        # 确保时钟步长平稳在1秒发送一次探测包（扣除探测消耗的时间）
+        elapsed = time.time() - start_t
+        sleep_time = max(0.1, 1.0 - elapsed)
+        time.sleep(sleep_time)
+
+# --- Flask 路由控制层 ---
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/ping/start', methods=['POST'])
+def start_ping():
+    try:
+        stop_all_pings()
+        for host in request.json.get('hosts', []):
+            if host.strip():
+                Thread(target=ping_worker, args=(host, strict_clean_host(host)), daemon=True).start()
+        return jsonify({"status": "success"})
+    except Exception as e:
+        return jsonify({"status": "error", "msg": str(e)})
+
+@app.route('/api/ping/status', methods=['GET'])
+def get_ping_status():
+    return jsonify(ping_status)
+
+@app.route('/api/ping/stop', methods=['POST'])
+def stop_ping_api():
+    stop_all_pings()
+    return jsonify({"status": "success"})
+def stop_all_pings():
+    global ping_threads, ping_status
+    ping_threads.clear()
+    ping_status.clear()
+    if platform.system().lower() == 'windows':
+        subprocess.Popen("taskkill /f /im ping.exe", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+@app.route('/api/exit_now', methods=['POST'])
+def exit_now():
+    print("\n[系统退出] 正在注销全部探测线程并回收系统资源...")
+    stop_all_pings()
+    # 核心微调：让后台在 0.2 秒后执行标准的系统退栈退出，从而触发 PyInstaller 绿色版的自删除清理钩子
+    def gentle_exit():
+        time.sleep(0.2)
+        os._exit(0)
+    Thread(target=gentle_exit, daemon=True).start()
+    return jsonify({"status": "exiting"})
+
+@app.route('/api/telnet', methods=['POST'])
+def run_telnet():
+    try:
+        hosts = request.json.get('hosts', [])
+        global_port = request.json.get('port', 80)
+        results, threads = [], []
+
+        def check_one(original_host):
+            target_host = strict_clean_host(original_host)
+            if not target_host: return
+            
+            port = global_port
+            port_match = re.search(r':(\d+)$', original_host.strip())
+            if port_match:
+                port = int(port_match.group(1))
+
+            now = time.strftime("%H:%M:%S")
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(2.0)
+                s.connect((target_host, port))
+                s.close()
+                res = {"host": target_host, "port": port, "status": True, "msg": "Open", "time": now}
+            except:
+                res = {"host": target_host, "port": port, "status": False, "msg": "Closed", "time": now}
+            
+            with result_lock:
+                results.append(res)
+
+        for h in hosts:
+            t = Thread(target=check_one, args=(h,))
+            threads.append(t)
+            t.start()
+            
+        for t in threads: t.join()
+        results.sort(key=lambda x: x['host'])
+        return jsonify(results)
+    except Exception as e:
+        return jsonify([{"host": "Error", "port": 0, "status": False, "msg": str(e), "time": "00:00:00"}])
+
+# --- 应用启动入口 ---
+
+def start_flask():
+    import logging
+    logging.getLogger('werkzeug').setLevel(logging.ERROR)
+    app.run(host='127.0.0.1', port=5000, debug=False, use_reloader=False)
+
+if __name__ == '__main__':
+    flask_thread = Thread(target=start_flask, daemon=True)
+    flask_thread.start()
+    time.sleep(0.5)
+
+    url = "http://127.0.0.1:5000"
+    sys_type = platform.system().lower()
+    
+    if sys_type == 'windows':
+        paths = [r"C:\Program Files\Google\Chrome\Application\chrome.exe", r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"]
+        chrome_path = next((p for p in paths if os.path.exists(p)), None)
+        chrome_cmd = [chrome_path, f"--app={url}", "--start-maximized"] if chrome_path else ["cmd", "/c", "start", "chrome", f"--app={url}", "--start-maximized"]
+    elif sys_type == 'darwin':
+        chrome_cmd = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", f"--app={url}", "--start-maximized"]
+    else:
+        chrome_cmd = ["google-chrome", f"--app={url}", "--start-maximized"]
+
+    print("启动控制台...")
+    try:
+        subprocess.Popen(chrome_cmd)
+    except:
+        print(f"[提示] 请手动访问: {url}")
+
+    flask_thread.join()
