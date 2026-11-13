@@ -10,3 +10,2900 @@ js-sha256/src/sha256.js:
    * @license MIT
    *)
 */
+
+
+11111111111111111111111111-rhel96_X86_setup
+#!/bin/bash
+# 本脚本适用于新装RHEL9.6/Rocky9.6系统的规范设置
+# 请谨慎用于已配置过相关参数的系统
+# 部分设置需重启系统生效
+# version: 0.6
+# ivan_wang@ymtc.com
+# 2025/08/26
+
+###########################################
+# Global Variable Definitions
+###########################################
+
+readonly LOG_FILE="/var/log/system_config_$(date +%Y%m%d%H%M%S).log"
+readonly BACKUP_DIR="/root/backup_$(date +%Y%m%d%H%M%S)"
+readonly REQUIRED_OS_VERSION="9.6|9.7"
+readonly REQUIRED_OS_NAME="(Red Hat Enterprise Linux|Rocky Linux|Oracle Linux Server)"
+readonly TIMEZONE="Asia/Shanghai"
+readonly NTP_SERVERS=("10.18.88.103 iburst")
+
+# Color definitions
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[0;33m'
+readonly BLUE='\033[0;34m'
+readonly Purple='\033[0;35m'
+readonly NC='\033[0m' # No Color
+readonly RESET="${NC}"
+# ==============================================================================
+#  YMTC Fab Environment Arrays (Added)
+# ==============================================================================
+readonly FAB_COLORS=(
+    "${RED}"       # FAB1 - 红色
+    "${GREEN}"     # FAB2 - 绿色
+    "${YELLOW}"    # FAB3 - 黄色
+    "${BLUE}"      # FABR - 蓝色
+    "${Purple}"    # EXT1 - 紫色（预留）
+    "${NC}"        # EXT2 - 默认色（预留）
+    "${NC}"        # EXT3 - 默认色（预留）
+    "${NC}"        # EXT4 - 默认色（预留）
+)
+readonly FAB_TAGS=(FAB1 FAB2 FAB3 FABR EXT1 EXT2 EXT3 EXT4)
+readonly FAB_NAMES=(
+    "YMTC Fab1"
+    "YMTC Fab2"
+    "YMTC Fab3"
+    "YMTC FabR"
+    "FAB Partition 5"
+    "FAB Partition 6"
+    "FAB Partition 7"
+    "FAB Partition 8"
+)
+readonly FAB_ACTIVE=(1 1 1 1 0 0 0 0)
+
+# 全局变量：存储用户最终选择的真实索引
+FAB_SELECTED_IDX=""
+
+
+# User configuration
+readonly USER_CONFIG=(
+    "sdbsman:Ljwc15yd#:sdbs:3009:3001"
+)
+
+# Service configuration
+readonly ENABLE_SERVICES=("chronyd" "kdump" "rsyslog")
+readonly DISABLE_SERVICES=("tuned.service" "ktune.service" "libvirtd.service" "postfix.service" "avahi-daemon.socket" "avahi-daemon.service" "avahi-dnsconfd.service" "bluetooth.service" "ModemManager.service" "auditd.service" "firewalld.service" "iscsi-onboot.service" "iscsi.service" "iscsid.socket" "iscsiuio.socket" "nis-domainname.service" "nvmefc-boot-connections.service" "vdo.service" "multipathd.socket" "bluetooth.target" "smartd.service")
+
+# Kernel parameters
+declare -A SYSCTL_PARAMS=(
+    ["vm.swappiness"]="10"
+    ["net.ipv4.ip_forward"]="0"
+    ["net.ipv4.conf.all.accept_source_route"]="0"
+    ["net.ipv4.conf.default.accept_source_route"]="0"
+    ["net.ipv4.conf.all.accept_redirects"]="0"
+    ["net.ipv4.conf.default.accept_redirects"]="0"
+    ["net.ipv4.conf.all.send_redirects"]="0"
+    ["net.ipv4.conf.default.send_redirects"]="0"
+    ["net.ipv4.icmp_echo_ignore_broadcasts"]="1"
+)
+
+# Password policy
+declare -A PASSWORD_POLICY=(
+    ["minlen"]="8"
+    ["dcredit"]="-1"
+    ["ucredit"]="-1"
+    ["lcredit"]="-1"
+    ["ocredit"]="-1"
+)
+
+# Faillock configuration
+declare -A FAILLOCK_CONFIG=(
+    ["deny"]="8"                     # Maximum allowed failed attempts
+    ["unlock_time"]="600"            # Lockout duration (seconds)
+    ["silent"]=""                    # Silent mode (don't show failure count)
+)
+
+# SSH configuration
+declare -A SSHD_CONFIG=(
+    ["PermitEmptyPasswords"]="no"
+    ["PermitRootLogin"]="no"
+    ["GSSAPIAuthentication"]="no"
+    ["UseDNS"]="no"
+)
+
+# System resource limits configuration
+declare -A LIMITS_CONFIG=(
+    ["* soft nofile"]="65536"
+    ["* hard nofile"]="65536"
+    ["* soft nproc"]="65536"
+    ["* hard nproc"]="65536"
+)
+
+# # Banner configuration
+# readonly BANNER_TEXT="###########################################
+#        YMTC FAB 3 Production Environment
+#          Authorized uses only.
+# All activity may be monitored and reported.
+# ###########################################"
+
+# Logrotate configuration
+readonly LOGROTATE_ROTATE=24
+
+# PS1 prompt configuration
+readonly PS1_CONFIG='\[\e[35;48m\][\u@\h \W]\\$ \[\e[m\]'
+
+# Profile environment variables configuration
+declare -a ETC_PROFILE_CONFIG=(
+    "HISTTIMEFORMAT=\"%F %T \""
+    "HISTSIZE=10000"
+    "HISTFILESIZE=10000"
+    "TMOUT=900"
+)
+
+# PROMPT_COMMAND configuration
+readonly PROMPT_COMMAND_SCRIPT='{
+    msg=$(history 1 | { read -r x y; echo "$y"; });
+    ip=$(who am i | { read -r _ tty _ _ ip;
+        [ -z "$ip" ] && ip=$tty;
+        echo "$ip" | tr -d "()";
+    });
+    logger -p local1.debug "[$(whoami)@$ip $(pwd)] $msg";
+}'
+
+###########################################
+# Function Definitions
+###########################################
+
+# Initialize logging system
+init_logging() {
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
+
+    # Save original stdout and stderr
+    exec 3>&1 4>&2
+
+    # Simple redirection to log file (console output will be lost)
+    exec 1>>"$LOG_FILE" 2>&1
+
+    # Now we need to manually log to both file and console
+    echo "=== System configuration script execution started ===" | tee -a "$LOG_FILE" >&3
+    echo "Time: $(date)" | tee -a "$LOG_FILE" >&3
+    echo "Hostname: $(hostname)" | tee -a "$LOG_FILE" >&3
+}
+
+# Logging function
+log() {
+    local level=$1
+    local message=$2
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local color=""
+
+    case "$level" in
+        ERROR) color="${RED}" ;;
+        WARN)  color="${YELLOW}" ;;
+        INFO)  color="${GREEN}" ;;
+        DEBUG) color="${BLUE}" ;;
+        *)     color="${NC}" ;;
+    esac
+
+    # Print to both log file and original stdout (fd 3)
+    echo -e "[${timestamp}] ${color}${level}${NC}: ${message}" >&3
+    echo -e "[${timestamp}] ${level}: ${message}" >> "$LOG_FILE"
+}
+
+# Check root privileges
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log "ERROR" "This script must be run as root"
+        exit 1
+    fi
+}
+
+# Create backup directory
+create_backup() {
+    mkdir -p "$BACKUP_DIR" || {
+        log "ERROR" "Failed to create backup directory"
+        exit 1
+    }
+    log "INFO" "Created backup directory: $BACKUP_DIR"
+}
+
+# Backup file
+backup_file() {
+    local file="$1"
+    if [[ -f "$file" ]]; then
+        cp -p "$file" "${BACKUP_DIR}/${file##*/}.bak" || {
+            log "WARN" "Failed to backup file $file"
+            return 1
+        }
+        log "DEBUG" "Backed up file: $file to $BACKUP_DIR"
+    else
+        log "DEBUG" "File $file does not exist, no backup needed"
+    fi
+}
+
+# Check OS version
+check_os_version() {
+    if [[ ! -f "/etc/os-release" ]]; then
+        log "ERROR" "Unable to determine OS version"
+        exit 1
+    fi
+
+    source "/etc/os-release"
+
+    if ! [[ "$VERSION_ID" =~ $REQUIRED_OS_VERSION && "$NAME" =~ $REQUIRED_OS_NAME ]]; then
+        log "ERROR" "This script is only for RHEL/Rocky/Oracle Linux ${REQUIRED_OS_VERSION} systems"
+        log "ERROR" "Current system: $PRETTY_NAME"
+        exit 1
+    fi
+
+    log "INFO" "Detected system: $PRETTY_NAME"
+}
+
+
+# Create users and groups
+create_users() {
+    for user_info in "${USER_CONFIG[@]}"; do
+        IFS=':' read -ra info <<< "$user_info"
+        local user="${info[0]}"
+        local passwd="${info[1]}"
+        local group="${info[2]}"
+        local user_id="${info[3]}"
+        local group_id="${info[4]}"
+
+        # Create group
+        if ! getent group "$group" >/dev/null; then
+            if groupadd -g "$group_id" "$group"; then
+                log "INFO" "Created group: $group (GID: $group_id)"
+            else
+                log "ERROR" "Failed to create group $group"
+                continue
+            fi
+        fi
+
+        # Create user
+        if ! id "$user" >/dev/null 2>&1; then
+            if useradd -u "$user_id" -g "$group" -s /bin/bash "$user"; then
+                log "INFO" "Created user: $user (UID: $user_id)"
+
+                # Set password
+                if echo "$user:$passwd" | chpasswd; then
+                    log "INFO" "Set password for user $user"
+                else
+                    log "ERROR" "Failed to set password for user $user"
+                fi
+            else
+                log "ERROR" "Failed to create user $user"
+            fi
+        else
+            log "DEBUG" "User $user already exists, skipping creation"
+        fi
+    done
+}
+
+# Configure sudo privileges
+configure_sudo() {
+    local sudoers_file="/etc/sudoers"
+    local sudoers_d="/etc/sudoers.d/sdbsman"
+
+    backup_file "$sudoers_file"
+
+    if [[ ! -f "$sudoers_d" ]]; then
+        echo "sdbsman ALL=(ALL) NOPASSWD: ALL" > "$sudoers_d" && \
+        chmod 440 "$sudoers_d" && \
+        log "INFO" "Configured sudo privileges for sdbsman"
+    else
+        log "DEBUG" "sudoers.d configuration already exists, skipping"
+    fi
+}
+
+# Disable SELinux
+disable_selinux() {
+grubby --update-kernel ALL --args selinux=0
+}
+
+# Configure system runlevel
+configure_runlevel() {
+    local target="multi-user.target"
+
+    if [[ $(systemctl get-default) != "$target" ]]; then
+        if systemctl set-default "$target" >/dev/null; then
+            log "INFO" "Set default runlevel to: $target"
+        else
+            log "ERROR" "Failed to set runlevel"
+        fi
+    else
+        log "DEBUG" "Runlevel already set to $target, no changes needed"
+    fi
+}
+
+# Configure timezone and time synchronization
+configure_time() {
+    # Set timezone
+    if timedatectl set-timezone "$TIMEZONE"; then
+        log "INFO" "Set timezone to: $TIMEZONE"
+    else
+        log "ERROR" "Failed to set timezone"
+    fi
+
+    # Configure chrony
+    local chrony_conf="/etc/chrony.conf"
+
+    backup_file "$chrony_conf"
+
+    # Clear existing server configuration
+    sed -i '/^server/d' "$chrony_conf"
+    sed -i '/pool 2\.rocky\.pool\.ntp\.org iburst/s/^/#/' "$chrony_conf"
+    
+    #Set clock to 24 hour format
+    localectl set-locale LC_TIME=C.UTF-8
+
+    # Add new time servers
+    for server in "${NTP_SERVERS[@]}"; do
+        echo "server $server" >> "$chrony_conf"
+    done
+
+    if systemctl restart chronyd; then
+        log "INFO" "Configured time synchronization servers"
+    else
+        log "ERROR" "Failed to restart chronyd service"
+    fi
+}
+
+# Configure system services
+configure_services() {
+    # Enable services
+    for service in "${ENABLE_SERVICES[@]}"; do
+        if systemctl is-enabled "$service" >/dev/null 2>&1; then
+        log "DEBUG" "Service $service already enabled, skipping"
+            continue
+        fi
+
+        if systemctl enable --now "$service"; then
+            log "INFO" "Enabled and started service: $service"
+        else
+            log "ERROR" "Failed to enable service $service"
+        fi
+    done
+
+    # Disable services
+    for service in "${DISABLE_SERVICES[@]}"; do
+        if ! systemctl is-enabled "$service" >/dev/null 2>&1; then
+            log "DEBUG" "Service $service already disabled, skipping"
+            continue
+        fi
+
+        if systemctl disable --now "$service"; then
+            log "INFO" "Disabled and stopped service: $service"
+        else
+            log "ERROR" "Failed to disable service $service"
+        fi
+    done
+}
+
+# Configure system resource limits
+configure_limits() {
+    local limits_conf="/etc/security/limits.conf"
+
+    backup_file "$limits_conf"
+
+    # Set resource limits
+    for limit in "${!LIMITS_CONFIG[@]}"; do
+        local value="${LIMITS_CONFIG[$limit]}"
+
+        if ! grep -q "^$limit" "$limits_conf"; then
+            echo -e "$limit\t$value" >> "$limits_conf"
+            log "DEBUG" "Added resource limit: $limit $value"
+        fi
+    done
+}
+
+# Configure system kernel parameters
+configure_sysctl() {
+    local sysctl_conf="/etc/sysctl.conf"
+
+    backup_file "$sysctl_conf"
+
+    # Update or add kernel parameters
+    for param in "${!SYSCTL_PARAMS[@]}"; do
+        local value="${SYSCTL_PARAMS[$param]}"
+
+        if grep -q "^$param" "$sysctl_conf"; then
+            if sed -i "s/^$param.*/$param = $value/" "$sysctl_conf"; then
+                log "DEBUG" "Updated kernel parameter: $param = $value"
+            else
+                log "ERROR" "Failed to update kernel parameter $param"
+            fi
+        else
+            echo "$param = $value" >> "$sysctl_conf"
+            log "DEBUG" "Added kernel parameter: $param = $value"
+        fi
+    done
+
+    if sysctl -p >/dev/null; then
+        log "INFO" "Applied system kernel parameters"
+    else
+        log "ERROR" "Failed to apply kernel parameters"
+    fi
+}
+
+# Configure password policy
+configure_password_policy() {
+    local pwquality_conf="/etc/security/pwquality.conf"
+
+    backup_file "$pwquality_conf"
+
+    # Update password quality requirements
+    for param in "${!PASSWORD_POLICY[@]}"; do
+        local value="${PASSWORD_POLICY[$param]}"
+
+        if grep -q "^$param" "$pwquality_conf"; then
+            if sed -i "s/^$param.*/$param = $value/" "$pwquality_conf"; then
+                log "DEBUG" "Updated password policy: $param = $value"
+            else
+                log "ERROR" "Failed to update password policy $param"
+            fi
+        else
+            echo "$param = $value" >> "$pwquality_conf"
+            log "DEBUG" "Added password policy: $param = $value"
+        fi
+    done
+}
+
+# Configure faillock (login failure locking)
+configure_faillock() {
+    local faillock_conf="/etc/security/faillock.conf"
+    local authselect_feature="with-faillock"
+
+    backup_file "$faillock_conf"
+
+    # Enable authselect feature if available
+    if command -v authselect >/dev/null 2>&1; then
+        if ! authselect current | grep -q "$authselect_feature"; then
+            if authselect enable-feature "$authselect_feature" >/dev/null; then
+                log "INFO" "Enabled authselect $authselect_feature feature"
+            else
+                log "ERROR" "Failed to enable authselect feature"
+                return 1
+            fi
+        else
+            log "DEBUG" "authselect feature already enabled"
+        fi
+    else
+        log "WARN" "authselect command not found, using pam_faillock directly"
+    fi
+
+# Update faillock configuration
+for param in "${!FAILLOCK_CONFIG[@]}"; do
+    local value="${FAILLOCK_CONFIG[$param]}"
+
+    if grep -q "^$param" "$faillock_conf"; then
+        if [[ -z "$value" ]]; then
+            if sed -i "s/^$param.*/$param/" "$faillock_conf"; then
+                log "DEBUG" "Updated faillock configuration: $param"
+            else
+                log "ERROR" "Failed to update faillock configuration $param"
+            fi
+        else
+            if sed -i "s/^$param.*/$param = $value/" "$faillock_conf"; then
+                log "DEBUG" "Updated faillock configuration: $param = $value"
+            else
+                log "ERROR" "Failed to update faillock configuration $param"
+            fi
+        fi
+    else
+        # 处理没有值的参数
+        if [[ -z "$value" ]]; then
+            echo "$param" >> "$faillock_conf"
+            log "DEBUG" "Added faillock configuration: $param"
+        else
+            echo "$param = $value" >> "$faillock_conf"
+            log "DEBUG" "Added faillock configuration: $param = $value"
+        fi
+    fi
+done
+
+    # Apply changes (no direct service to reload for faillock)
+    log "INFO" "Faillock configuration updated (changes may require reauthentication to take effect)"
+}
+
+# Select YMTC Fab Environment
+select_yamtc_fab() {
+    local valid_indexes=()
+    local disp real_idx choice
+    local i count=0
+
+    # 只收集 ACTIVE=1 的分区索引
+    for i in 0 1 2 3 4 5 6 7; do
+        if [ "${FAB_ACTIVE[$i]}" = "1" ]; then
+            valid_indexes[$count]="$i"
+            count=$((count + 1))
+        fi
+    done
+
+
+    # 清屏并显示选择菜单
+    clear
+    # echo "============================================"
+    echo "     YMTC Fab Environment Configuration"
+    echo "============================================"
+    echo
+    echo "  请选择当前 Fab 分区："
+    echo
+    for disp in "${!valid_indexes[@]}"; do
+        real_idx="${valid_indexes[$disp]}"
+        echo -e "   ${FAB_COLORS[$real_idx]}$((disp + 1))) ${FAB_NAMES[$real_idx]}${NC}"
+    done
+    echo
+    
+    while true; do
+        read -p "  输入选项 [1-${#valid_indexes[@]}]: " choice
+        choice=$((choice - 1))
+        if [ "$choice" -ge 0 ] && [ "$choice" -lt "${#valid_indexes[@]}" ]; then
+            break
+        fi
+        echo -e "${RED}[错误] 无效选项，请重新输入。${NC}"
+    done
+
+    # 映射回真实数组索引并存入全局变量
+    FAB_SELECTED_IDX="${valid_indexes[$choice]}"
+    log "INFO" "用户选择了 Fab 分区: ${FAB_NAMES[$FAB_SELECTED_IDX]}"
+}
+
+# Configure SSH service
+configure_ssh() {
+    local sshd_conf="/etc/ssh/sshd_config"
+
+    backup_file "$sshd_conf"
+
+    # Update SSH configuration
+    for param in "${!SSHD_CONFIG[@]}"; do
+        local value="${SSHD_CONFIG[$param]}"
+
+        if grep -q "^$param" "$sshd_conf"; then
+            if sed -i "s/^$param.*/$param $value/" "$sshd_conf"; then
+                log "DEBUG" "Updated SSH configuration: $param $value"
+            else
+                log "ERROR" "Failed to update SSH configuration $param"
+            fi
+        else
+            echo "$param $value" >> "$sshd_conf"
+            log "DEBUG" "Added SSH configuration: $param $value"
+        fi
+    done
+
+    if systemctl reload sshd; then
+        log "INFO" "Reloaded SSH service"
+    else
+        log "ERROR" "Failed to reload SSH service"
+    fi
+}
+
+# Configure system banner
+configure_banner() {
+    local profile_script="/etc/profile.d/yamtc-fab.sh"
+    log "INFO" "正在配置 YMTC Fab 登录 Banner..."
+    
+    # 清除所有用户 ~/.bashrc 里残留的旧 YMTC 块
+    for home_dir in /root /home/*; do
+        if [ -f "$home_dir/.bashrc" ]; then
+            sed -i '/# === YMTC BEGIN ===/,/# === YMTC END ===/d' "$home_dir/.bashrc" 2>/dev/null
+        fi
+    done
+
+    # 写入全局模板配置
+    cat > "$profile_script" <<'TEMPLATE'
+# === YMTC FAB GLOBAL BEGIN ===
+case $- in *i*) ;; *) return;; esac
+clear
+echo -e '__FAB_COLOR__##############################################__NC_COLOR__'
+echo -e '__FAB_COLOR__        __FAB_NAME__ Production Environment__NC_COLOR__'
+echo -e '__FAB_COLOR__                Authorized user only.__NC_COLOR__'
+echo -e '__FAB_COLOR__All activity may be monitored and reported.__NC_COLOR__'
+echo -e '__FAB_COLOR__##################################################__NC_COLOR__'
+# === YMTC FAB GLOBAL END ===
+TEMPLATE
+
+    # 安全转义替换
+    local fab_color_safe="${FAB_COLORS[$FAB_SELECTED_IDX]//\\/\\\\}"
+    local nc_safe="${NC//\\/\\\\}"
+
+    sed -i \
+        -e "s|__FAB_COLOR__|${fab_color_safe}|g" \
+        -e "s|__NC_COLOR__|${nc_safe}|g" \
+        -e "s|__FAB_TAG__|${FAB_TAGS[$FAB_SELECTED_IDX]}|g" \
+        -e "s|__FAB_NAME__|${FAB_NAMES[$FAB_SELECTED_IDX]}|g" \
+        "$profile_script"
+
+    chmod +x "$profile_script"
+    > /etc/motd   # 清空系统默认 motd，避免重复显示
+    log "INFO" "成功配置 ${FAB_NAMES[$FAB_SELECTED_IDX]} 登录 Banner"
+}
+
+
+
+# Configure logrotate rotation policy
+configure_logrotate() {
+    local logrotate_conf="/etc/logrotate.conf"
+    local expected_rotate="$LOGROTATE_ROTATE"
+    
+    backup_file "$logrotate_conf"
+    
+    # Get current rotation value
+    local current_rotate=$(awk '/^rotate/ {print $2}' "$logrotate_conf" 2>/dev/null)
+    
+    if [[ -z "$current_rotate" ]]; then
+        log "WARN" "No existing 'rotate' directive found in $logrotate_conf"
+        echo "rotate $expected_rotate" >> "$logrotate_conf"
+        log "INFO" "Added 'rotate $expected_rotate' to $logrotate_conf"
+    elif [[ "$current_rotate" -ne "$expected_rotate" ]]; then
+        if sed -i "s/^rotate.*/rotate $expected_rotate/" "$logrotate_conf"; then
+            log "INFO" "Updated log rotation from $current_rotate to $expected_rotate in $logrotate_conf"
+        else
+            log "ERROR" "Failed to update rotate setting in $logrotate_conf"
+            return 1
+        fi
+    else
+        log "DEBUG" "Log rotation already set to $expected_rotate, no changes needed"
+    fi
+}
+
+# Configure rsyslog for command history logging
+configure_rsyslog_history() {
+    local rsyslog_conf="/etc/rsyslog.conf"
+    local history_log="/var/log/history"
+    local config_line="local1.* $history_log"
+    
+    backup_file "$rsyslog_conf"
+    
+    # Check if configuration already exists
+    if grep -qE "^\s*local1\.\*\s+$history_log" "$rsyslog_conf"; then
+        log "DEBUG" "rsyslog history logging already configured, skipping"
+        return 0
+    fi
+    
+    # Add configuration
+    echo "$config_line" >> "$rsyslog_conf"
+    log "INFO" "Added command history logging to $rsyslog_conf"
+    
+    # Create history log file with proper permissions
+    touch "$history_log" && \
+    chmod 600 "$history_log" && \
+    chown root:root "$history_log"
+    
+    if [[ $? -ne 0 ]]; then
+        log "ERROR" "Failed to setup history log file"
+        return 1
+    fi
+    
+    # Restart rsyslog service
+    if systemctl restart rsyslog >/dev/null 2>&1; then
+        log "INFO" "Restarted rsyslog service"
+    else
+        log "ERROR" "Failed to restart rsyslog service"
+        return 1
+    fi
+    
+    # Add logrotate entry for history log
+    local logrotate_dir="/etc/logrotate.d"
+    local history_rotate="$logrotate_dir/history"
+    
+    mkdir -p "$logrotate_dir"
+    cat > "$history_rotate" <<- EOF
+$history_log {
+    missingok
+    notifempty
+    daily
+    rotate $LOGROTATE_ROTATE
+    create 0600 root root
+}
+EOF
+    
+    log "INFO" "Created logrotate configuration for history log"
+}
+
+#Disable cron email
+configure_crond_args() {
+    # Define the configuration file path
+    local crond_file="/etc/sysconfig/crond"
+
+    backup_file "$crond_file"
+    
+    # Verify the configuration file exists
+    if [ ! -f "$crond_file" ]; then
+        echo "Error: Configuration file $crond_file not found" >&2
+        return 1
+    fi
+    
+    # Check if CRONDARGS parameter already exists
+    if grep -q '^CRONDARGS=' "$crond_file"; then
+        # Replace existing configuration with new value
+        sed -i 's/^CRONDARGS=.*/CRONDARGS="-m off"/' "$crond_file"
+    else
+        # Append new configuration to end of file
+        echo 'CRONDARGS="-m off"' >> "$crond_file"
+    fi
+    
+    # Confirm successful modification
+    echo "CRONDARGS has been updated to '-m off' in $crond_file"
+}
+
+# Configure PS1 prompt
+configure_ps1() {
+    local bashrc_file="/etc/bashrc"
+    backup_file "$bashrc_file"
+
+    if [[ "$(hostname)" =~ ^p ]]; then
+        log "INFO" "检测到主机名符合条件，正在配置彩色 PS1..."
+        
+        # 清除 /etc/bashrc 里残留的旧 PS1 块
+        sed -i '/# === YMTC PS1 BEGIN ===/,/# === YMTC PS1 END ===/d' "$bashrc_file" 2>/dev/null
+        
+        # 追加新配置模板到末尾
+        cat >> "$bashrc_file" <<'TEMPLATE'
+# === YMTC PS1 BEGIN ===
+PS1=$'\[__FAB_COLOR__\][\u@\h __FAB_TAG__ \W]\$\[__NC_COLOR__\] '
+# === YMTC PS1 END ===
+TEMPLATE
+
+        # 安全转义替换
+        local fab_color_safe="${FAB_COLORS[$FAB_SELECTED_IDX]//\\/\\\\}"
+        local nc_safe="${NC//\\/\\\\}"
+
+        sed -i \
+            -e "s|__FAB_COLOR__|${fab_color_safe}|g" \
+            -e "s|__NC_COLOR__|${nc_safe}|g" \
+            -e "s|__FAB_TAG__|${FAB_TAGS[$FAB_SELECTED_IDX]}|g" \
+            "$bashrc_file"
+            
+        log "INFO" "成功配置 PS1 变量为 [${FAB_TAGS[$FAB_SELECTED_IDX]}] 样式"
+    else
+        log "DEBUG" "Hostname doesn't start with 'p', skipping PS1 configuration"
+    fi
+}
+
+
+# Configure profile environment variables
+configure_profile() {
+    local profile_file="/etc/profile"
+
+#    backup_file "$profile_file"
+
+    # Temporarily load profile file
+    source "$profile_file" || {
+        log "WARN" "Failed to load profile file"
+        return 1
+    }
+
+    for line in "${ETC_PROFILE_CONFIG[@]}"; do
+        local item="${line%%=*}"
+        local value="${line#*=}"
+        local current_value
+
+        # Safely get variable value
+        if declare -p "$item" &>/dev/null; then
+            current_value=$(eval "echo \"\$$item\"")
+        else
+            current_value=""
+        fi
+
+        # Remove possible quotes for comparison
+        local unquoted_value=$(eval "echo $value")
+        local unquoted_current=$(eval "echo $current_value")
+
+        if [[ "$unquoted_current" != "$unquoted_value" ]]; then
+            # Remove old configuration
+            sed -i "/^export\s\+${item}=/d" "$profile_file"
+            # Add new configuration
+            echo "export ${item}=${value}" >> "$profile_file" && \
+            log "INFO" "Configured profile environment variable: ${item}=${value}"
+        else
+            log "DEBUG" "Profile environment variable ${item} already configured, skipping"
+        fi
+    done
+}
+
+# Configure PROMPT_COMMAND
+configure_prompt_command() {
+    local profile_file="/etc/profile"
+
+#    backup_file "$profile_file"
+
+    # Temporarily load profile file
+    source "$profile_file" || {
+        log "WARN" "Failed to load profile file"
+        return 1
+    }
+
+    # Standardize comparison by removing extra spaces and quotes
+    local current_pc=$(eval "echo \"$PROMPT_COMMAND\"")
+    local new_pc=$(eval "echo \"$PROMPT_COMMAND_SCRIPT\"")
+
+    if [[ "$current_pc" != "$new_pc" ]]; then
+        # Remove old configuration
+        sed -i '/^\s*[^#]*PROMPT_COMMAND=/d' "$profile_file"
+        # Add new configuration
+        echo "export PROMPT_COMMAND='$PROMPT_COMMAND_SCRIPT'" >> "$profile_file" && \
+        log "INFO" "Configured PROMPT_COMMAND"
+    else
+        log "DEBUG" "PROMPT_COMMAND already configured, skipping"
+    fi
+}
+
+# Configure yum repositories
+configure_yum_repo() {
+    local repo_file="/etc/yum.repos.d/base.repo"
+    local os_type
+    local pretty_name
+    #backup repo configure
+	mkdir /etc/yum.repos.d/repo_bak
+	mv /etc/yum.repos.d/*.repo /etc/yum.repos.d/repo_bak
+	
+    # Check and parse os-release file
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        pretty_name="$PRETTY_NAME"
+    else
+        log "ERROR" "File /etc/os-release not found."
+        return 1
+    fi
+
+    # Determine repository type based on PRETTY_NAME
+    case "$pretty_name" in
+        *"Rocky Linux 9.6"*)
+            os_type="rocky96"
+            ;;
+        *"Rocky Linux 9.7"*)
+            os_type="rocky97"
+            ;;
+        *"Rocky Linux 9.8"*)
+            os_type="rocky98"
+            ;;
+        *"Rocky Linux 9.9"*)
+            os_type="rocky99"
+            ;;
+        *"Rocky Linux 9.10"*)
+            os_type="rocky910"
+            ;;
+        *"Oracle Linux Server 9.7"*)
+            os_type="oracle97"
+            ;;
+        *"Oracle Linux Server 9.8"*)
+            os_type="oracle98"
+            ;;
+        *"Oracle Linux Server 9.9"*)
+            os_type="oracle99"
+            ;;
+        *"Oracle Linux Server 9.10"*)
+            os_type="oracle910"
+            ;;
+        *"Red Hat Enterprise Linux"*)
+            os_type="rhel96"
+            ;;
+        *"Rocky Linux"*)
+            # Default Rocky Linux handling
+            if [[ "$pretty_name" == *"9."* ]]; then
+                os_type="rocky96"
+            elif [[ "$pretty_name" == *"8."* ]]; then
+                os_type="rocky810"
+            else
+                os_type="rocky"
+            fi
+            ;;
+        *"Oracle Linux Server"*)
+            # Default Oracle Linux handling
+            if [[ "$pretty_name" == *"9.7"* ]]; then
+                os_type="oracle97"
+            elif [[ "$pretty_name" == *"9."* ]]; then
+                os_type="oracle96"
+            else
+                os_type="oracle"
+            fi
+            ;;
+        *)
+            log "ERROR" "Unable to determine OS type from PRETTY_NAME: $pretty_name"
+            return 1
+            ;;
+    esac
+
+    backup_file "$repo_file"
+
+    cat > "$repo_file" << EOF
+[BaseOS]
+name=BaseOS
+baseurl=http://10.129.36.250/${os_type}/BaseOS
+gpgcheck=0
+enabled=1
+
+[AppStream]
+name=AppStream
+baseurl=http://10.129.36.250/${os_type}/AppStream
+gpgcheck=0
+enabled=1
+EOF
+
+# install iostat tool
+    yum clean all 
+    yum makecache
+    yum install -y sysstat
+    log "INFO" "Configured YUM repositories"
+}
+
+# Disable USB storage
+disable_usb_storage() {
+    local modprobe_conf="/etc/modprobe.d/usb-storage.conf"
+
+    if echo "install usb-storage /bin/true" > "$modprobe_conf"; then
+        log "INFO" "Disabled USB storage"
+    else
+        log "ERROR" "Failed to disable USB storage"
+    fi
+}
+
+# Disable Ctrl+Alt+Del
+disable_ctrl_alt_del() {
+    systemctl disable ctrl-alt-del.target
+    if systemctl mask ctrl-alt-del.target >/dev/null; then
+        log "INFO" "Disabled Ctrl+Alt+Del key combination"
+    else
+        log "ERROR" "Failed to disable Ctrl+Alt+Del"
+    fi
+}
+
+# enable_network_lldp
+enable_network_lldp() {
+    virt_type=$(systemd-detect-virt 2>/dev/null || true)
+    log "INFO" "检测虚拟化环境: virt_type=[${virt_type:-空}]"
+    if [ "$virt_type" = "none" ]; then
+        log "INFO" "物理机，开始下载并执行 enable_lldp.sh"
+        if wget -nv -O /tmp/enable_lldp.sh http://10.129.36.250/scripts/enable_lldp.sh; then
+            chmod +x /tmp/enable_lldp.sh
+            bash /tmp/enable_lldp.sh
+            rc=$?
+            rm -rf /tmp/enable_lldp.sh
+            if [ "$rc" -eq 0 ]; then
+                log "INFO" "LLDP 配置执行完成"
+            else
+                log "ERROR" "enable_lldp.sh 执行失败 (退出码=$rc)"
+            fi
+        else
+            log "ERROR" "wget 下载失败，请检查网络或脚本地址 http://10.129.36.250/scripts/enable_lldp.sh"
+        fi
+    else
+        log "INFO" "检测到虚拟机 (${virt_type})，跳过 LLDP 配置"
+    fi
+}
+
+# Cleanup work
+cleanup() {
+    exec 1>&3 2>&4
+    log "INFO" "System configuration completed, some settings require reboot to take effect"
+    log "INFO" "Detailed logs available at: $LOG_FILE"
+    log "INFO" "Configuration file backups in: $BACKUP_DIR"
+}
+
+###########################################
+# Main Function
+###########################################
+
+main() {
+    # Initialization
+	select_yamtc_fab
+    init_logging
+    check_root
+    create_backup
+    check_os_version
+
+    # Execute configurations
+    create_users
+    configure_sudo
+    disable_selinux
+    configure_runlevel
+    configure_time
+    configure_services
+    configure_limits
+    configure_sysctl
+    configure_password_policy
+    configure_faillock
+    configure_ssh
+    configure_banner
+    configure_logrotate
+    configure_rsyslog_history
+    configure_crond_args
+    configure_ps1
+    configure_profile
+    configure_prompt_command
+    configure_yum_repo
+    disable_usb_storage
+    disable_ctrl_alt_del
+	enable_network_lldp
+
+    # Cleanup and summary
+    cleanup
+}
+
+# Execute main function
+main "$@"
+
+
+
+    22222222222222222222222rhel810_X86_setup
+    #!/bin/bash
+# 本脚本适用于新装RHEL8.10/Rocky8.10系统的规范设置
+# 请谨慎用于已配置过相关参数的系统
+# 部分设置需重启系统生效
+# version: 0.6
+# ivan_wang@ymtc.com
+# 2025/07/16
+
+###########################################
+# Global Variable Definitions
+###########################################
+
+readonly LOG_FILE="/var/log/system_config_$(date +%Y%m%d%H%M%S).log"
+readonly BACKUP_DIR="/root/backup_$(date +%Y%m%d%H%M%S)"
+readonly REQUIRED_OS_VERSION="8.10"
+readonly REQUIRED_OS_NAME="(Red Hat Enterprise Linux|Rocky Linux)"
+readonly TIMEZONE="Asia/Shanghai"
+readonly NTP_SERVERS=("10.18.88.103 iburst")
+
+# Color definitions
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[0;33m'
+readonly BLUE='\033[0;34m'
+readonly NC='\033[0m' # No Color
+readonly RESET="${NC}"
+# ==============================================================================
+#  YMTC Fab Environment Arrays (Added)
+# ==============================================================================
+readonly FAB_COLORS=(
+    "${RED}"       # FAB1 - 红色
+    "${GREEN}"     # FAB2 - 绿色
+    "${YELLOW}"    # FAB3 - 黄色
+    "${BLUE}"      # FABR - 蓝色
+    "${Purple}"    # EXT1 - 紫色（预留）
+    "${NC}"        # EXT2 - 默认色（预留）
+    "${NC}"        # EXT3 - 默认色（预留）
+    "${NC}"        # EXT4 - 默认色（预留）
+)
+readonly FAB_TAGS=(FAB1 FAB2 FAB3 FABR EXT1 EXT2 EXT3 EXT4)
+readonly FAB_NAMES=(
+    "YMTC Fab1"
+    "YMTC Fab2"
+    "YMTC Fab3"
+    "YMTC FabR"
+    "FAB Partition 5"
+    "FAB Partition 6"
+    "FAB Partition 7"
+    "FAB Partition 8"
+)
+readonly FAB_ACTIVE=(1 1 1 1 0 0 0 0)
+# User configuration
+readonly USER_CONFIG=(
+    "sdbsman:Ljwc15yd#:sdbs:3009:3001"
+)
+
+# Service configuration
+readonly ENABLE_SERVICES=("chronyd" "kdump" "rsyslog")
+readonly DISABLE_SERVICES=("tuned.service" "ktune.service" "libvirtd.service" "postfix.service" "avahi-daemon.socket" "avahi-daemon.service" "avahi-dnsconfd.service" "bluetooth.service" "ModemManager.service" "auditd.service" "firewalld.service" "iscsi-onboot.service" "iscsi.service" "iscsid.socket" "iscsiuio.socket" "nis-domainname.service" "nvmefc-boot-connections.service" "vdo.service" "multipathd.socket" "bluetooth.target" "smartd.service")
+
+# Kernel parameters
+declare -A SYSCTL_PARAMS=(
+    ["vm.swappiness"]="10"
+    ["net.ipv4.ip_forward"]="0"
+    ["net.ipv4.conf.all.accept_source_route"]="0"
+    ["net.ipv4.conf.default.accept_source_route"]="0"
+    ["net.ipv4.conf.all.accept_redirects"]="0"
+    ["net.ipv4.conf.default.accept_redirects"]="0"
+    ["net.ipv4.conf.all.send_redirects"]="0"
+    ["net.ipv4.conf.default.send_redirects"]="0"
+    ["net.ipv4.icmp_echo_ignore_broadcasts"]="1"
+)
+
+# Password policy
+declare -A PASSWORD_POLICY=(
+    ["minlen"]="8"
+    ["dcredit"]="-1"
+    ["ucredit"]="-1"
+    ["lcredit"]="-1"
+    ["ocredit"]="-1"
+)
+
+# Faillock configuration
+declare -A FAILLOCK_CONFIG=(
+    ["deny"]="8"                     # Maximum allowed failed attempts
+    ["unlock_time"]="600"            # Lockout duration (seconds)
+    ["silent"]=""                    # Silent mode (don't show failure count)
+)
+
+# SSH configuration
+declare -A SSHD_CONFIG=(
+    ["PermitEmptyPasswords"]="no"
+    ["PermitRootLogin"]="no"
+    ["GSSAPIAuthentication"]="no"
+    ["UseDNS"]="no"
+)
+
+# System resource limits configuration
+declare -A LIMITS_CONFIG=(
+    ["* soft nofile"]="65536"
+    ["* hard nofile"]="65536"
+    ["* soft nproc"]="65536"
+    ["* hard nproc"]="65536"
+)
+
+# # Banner configuration
+# readonly BANNER_TEXT="###########################################
+#        YMTC FAB 2 Production Environment
+#          Authorized uses only.
+# All activity may be monitored and reported.
+# ###########################################"
+
+# Logrotate configuration
+readonly LOGROTATE_ROTATE=24
+
+# PS1 prompt configuration
+readonly PS1_CONFIG='\[\e[32;48m\][\u@\h \W]\\$ \[\e[m\]'
+
+# Profile environment variables configuration
+declare -a ETC_PROFILE_CONFIG=(
+    "HISTTIMEFORMAT=\"%F %T \""
+    "HISTSIZE=10000"
+    "HISTFILESIZE=10000"
+	"TMOUT=900"
+)
+
+# PROMPT_COMMAND configuration
+readonly PROMPT_COMMAND_SCRIPT='{
+    msg=$(history 1 | { read -r x y; echo "$y"; });
+    ip=$(who am i | { read -r _ tty _ _ ip;
+        [ -z "$ip" ] && ip=$tty;
+        echo "$ip" | tr -d "()";
+    });
+    logger -p local1.debug "[$(whoami)@$ip $(pwd)] $msg";
+}'
+
+###########################################
+# Function Definitions
+###########################################
+
+# Initialize logging system
+init_logging() {
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
+
+    # Save original stdout and stderr
+    exec 3>&1 4>&2
+
+    # Simple redirection to log file (console output will be lost)
+    exec 1>>"$LOG_FILE" 2>&1
+
+    # Now we need to manually log to both file and console
+    echo "=== System configuration script execution started ===" | tee -a "$LOG_FILE" >&3
+    echo "Time: $(date)" | tee -a "$LOG_FILE" >&3
+    echo "Hostname: $(hostname)" | tee -a "$LOG_FILE" >&3
+}
+
+# Logging function
+log() {
+    local level=$1
+    local message=$2
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local color=""
+
+    case "$level" in
+        ERROR) color="${RED}" ;;
+        WARN)  color="${YELLOW}" ;;
+        INFO)  color="${GREEN}" ;;
+        DEBUG) color="${BLUE}" ;;
+        *)     color="${NC}" ;;
+    esac
+
+    # Print to both log file and original stdout (fd 3)
+    echo -e "[${timestamp}] ${color}${level}${NC}: ${message}" >&3
+    echo -e "[${timestamp}] ${level}: ${message}" >> "$LOG_FILE"
+}
+
+# Check root privileges
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log "ERROR" "This script must be run as root"
+        exit 1
+    fi
+}
+
+# Create backup directory
+create_backup() {
+    mkdir -p "$BACKUP_DIR" || {
+        log "ERROR" "Failed to create backup directory"
+        exit 1
+    }
+    log "INFO" "Created backup directory: $BACKUP_DIR"
+}
+
+# Backup file
+backup_file() {
+    local file="$1"
+    if [[ -f "$file" ]]; then
+        cp -p "$file" "${BACKUP_DIR}/${file##*/}.bak" || {
+            log "WARN" "Failed to backup file $file"
+            return 1
+        }
+        log "DEBUG" "Backed up file: $file to $BACKUP_DIR"
+    else
+        log "DEBUG" "File $file does not exist, no backup needed"
+    fi
+}
+
+# Check OS version
+check_os_version() {
+    if [[ ! -f "/etc/os-release" ]]; then
+        log "ERROR" "Unable to determine OS version"
+        exit 1
+    fi
+
+    source "/etc/os-release"
+
+    if ! [[ "$VERSION_ID" == "$REQUIRED_OS_VERSION" && "$NAME" =~ $REQUIRED_OS_NAME ]]; then
+        log "ERROR" "This script is only for RHEL/Rocky 8.10 systems"
+        log "ERROR" "Current system: $PRETTY_NAME"
+        exit 1
+    fi
+
+    log "INFO" "Detected system: $PRETTY_NAME"
+}
+
+# Create users and groups
+create_users() {
+    for user_info in "${USER_CONFIG[@]}"; do
+        IFS=':' read -ra info <<< "$user_info"
+        local user="${info[0]}"
+        local passwd="${info[1]}"
+        local group="${info[2]}"
+        local user_id="${info[3]}"
+        local group_id="${info[4]}"
+
+        # Create group
+        if ! getent group "$group" >/dev/null; then
+            if groupadd -g "$group_id" "$group"; then
+                log "INFO" "Created group: $group (GID: $group_id)"
+            else
+                log "ERROR" "Failed to create group $group"
+                continue
+            fi
+        fi
+
+        # Create user
+        if ! id "$user" >/dev/null 2>&1; then
+            if useradd -u "$user_id" -g "$group" -s /bin/bash "$user"; then
+                log "INFO" "Created user: $user (UID: $user_id)"
+
+                # Set password
+                if echo "$user:$passwd" | chpasswd; then
+                    log "INFO" "Set password for user $user"
+                else
+                    log "ERROR" "Failed to set password for user $user"
+                fi
+            else
+                log "ERROR" "Failed to create user $user"
+            fi
+        else
+            log "DEBUG" "User $user already exists, skipping creation"
+        fi
+    done
+}
+
+# Configure sudo privileges
+configure_sudo() {
+    local sudoers_file="/etc/sudoers"
+    local sudoers_d="/etc/sudoers.d/sdbsman"
+
+    backup_file "$sudoers_file"
+
+    if [[ ! -f "$sudoers_d" ]]; then
+        echo "sdbsman ALL=(ALL) NOPASSWD: ALL" > "$sudoers_d" && \
+        chmod 440 "$sudoers_d" && \
+        log "INFO" "Configured sudo privileges for sdbsman"
+    else
+        log "DEBUG" "sudoers.d configuration already exists, skipping"
+    fi
+}
+
+# Disable SELinux
+disable_selinux() {
+    local selinux_config="/etc/selinux/config"
+
+    backup_file "$selinux_config"
+
+    if grep -q "^SELINUX=enforcing" "$selinux_config"; then
+        if sed -i 's/^SELINUX=enforcing/SELINUX=disabled/' "$selinux_config"; then
+            log "INFO" "Disabled SELinux (requires reboot to take effect)"
+        else
+            log "ERROR" "Failed to modify SELinux configuration"
+        fi
+    else
+        log "DEBUG" "SELinux already disabled or not enabled, no changes needed"
+    fi
+}
+
+# Configure system runlevel
+configure_runlevel() {
+    local target="multi-user.target"
+
+    if [[ $(systemctl get-default) != "$target" ]]; then
+        if systemctl set-default "$target" >/dev/null; then
+            log "INFO" "Set default runlevel to: $target"
+        else
+            log "ERROR" "Failed to set runlevel"
+        fi
+    else
+        log "DEBUG" "Runlevel already set to $target, no changes needed"
+    fi
+}
+
+# Configure timezone and time synchronization
+configure_time() {
+    # Set timezone
+    if timedatectl set-timezone "$TIMEZONE"; then
+        log "INFO" "Set timezone to: $TIMEZONE"
+    else
+        log "ERROR" "Failed to set timezone"
+    fi
+
+    # Configure chrony
+    local chrony_conf="/etc/chrony.conf"
+
+    backup_file "$chrony_conf"
+
+    # Clear existing server configuration
+    sed -i '/^server/d' "$chrony_conf"
+    #sed -i '/^pool/d' "$chrony_conf"
+    sed -i '/pool 2\.rocky\.pool\.ntp\.org iburst/s/^/#/' "$chrony_conf"
+
+    # Add new time servers
+    for server in "${NTP_SERVERS[@]}"; do
+        echo "server $server" >> "$chrony_conf"
+    done
+
+    if systemctl restart chronyd; then
+        log "INFO" "Configured time synchronization servers"
+    else
+        log "ERROR" "Failed to restart chronyd service"
+    fi
+}
+
+# Configure system services
+configure_services() {
+    # Enable services
+    for service in "${ENABLE_SERVICES[@]}"; do
+        if systemctl is-enabled "$service" >/dev/null 2>&1; then
+        log "DEBUG" "Service $service already enabled, skipping"
+            continue
+        fi
+
+        if systemctl enable --now "$service"; then
+            log "INFO" "Enabled and started service: $service"
+        else
+            log "ERROR" "Failed to enable service $service"
+        fi
+    done
+
+    # Disable services
+    for service in "${DISABLE_SERVICES[@]}"; do
+        if ! systemctl is-enabled "$service" >/dev/null 2>&1; then
+            log "DEBUG" "Service $service already disabled, skipping"
+            continue
+        fi
+
+        if systemctl disable --now "$service"; then
+            log "INFO" "Disabled and stopped service: $service"
+        else
+            log "ERROR" "Failed to disable service $service"
+        fi
+    done
+}
+
+# Configure system resource limits
+configure_limits() {
+    local limits_conf="/etc/security/limits.conf"
+
+    backup_file "$limits_conf"
+
+    # Set resource limits
+    for limit in "${!LIMITS_CONFIG[@]}"; do
+        local value="${LIMITS_CONFIG[$limit]}"
+
+        if ! grep -q "^$limit" "$limits_conf"; then
+            echo -e "$limit\t$value" >> "$limits_conf"
+            log "DEBUG" "Added resource limit: $limit $value"
+        fi
+    done
+}
+
+# Configure system kernel parameters
+configure_sysctl() {
+    local sysctl_conf="/etc/sysctl.conf"
+
+    backup_file "$sysctl_conf"
+
+    # Update or add kernel parameters
+    for param in "${!SYSCTL_PARAMS[@]}"; do
+        local value="${SYSCTL_PARAMS[$param]}"
+
+        if grep -q "^$param" "$sysctl_conf"; then
+            if sed -i "s/^$param.*/$param = $value/" "$sysctl_conf"; then
+                log "DEBUG" "Updated kernel parameter: $param = $value"
+            else
+                log "ERROR" "Failed to update kernel parameter $param"
+            fi
+        else
+            echo "$param = $value" >> "$sysctl_conf"
+            log "DEBUG" "Added kernel parameter: $param = $value"
+        fi
+    done
+
+    if sysctl -p >/dev/null; then
+        log "INFO" "Applied system kernel parameters"
+    else
+        log "ERROR" "Failed to apply kernel parameters"
+    fi
+}
+
+# Configure password policy
+configure_password_policy() {
+    local pwquality_conf="/etc/security/pwquality.conf"
+
+    backup_file "$pwquality_conf"
+
+    # Update password quality requirements
+    for param in "${!PASSWORD_POLICY[@]}"; do
+        local value="${PASSWORD_POLICY[$param]}"
+
+        if grep -q "^$param" "$pwquality_conf"; then
+            if sed -i "s/^$param.*/$param = $value/" "$pwquality_conf"; then
+                log "DEBUG" "Updated password policy: $param = $value"
+            else
+                log "ERROR" "Failed to update password policy $param"
+            fi
+        else
+            echo "$param = $value" >> "$pwquality_conf"
+            log "DEBUG" "Added password policy: $param = $value"
+        fi
+    done
+}
+
+# Configure faillock (login failure locking)
+configure_faillock() {
+    local faillock_conf="/etc/security/faillock.conf"
+    local authselect_feature="with-faillock"
+
+    backup_file "$faillock_conf"
+
+    # Enable authselect feature if available
+    if command -v authselect >/dev/null 2>&1; then
+        if ! authselect current | grep -q "$authselect_feature"; then
+            if authselect enable-feature "$authselect_feature" >/dev/null; then
+                log "INFO" "Enabled authselect $authselect_feature feature"
+            else
+                log "ERROR" "Failed to enable authselect feature"
+                return 1
+            fi
+        else
+            log "DEBUG" "authselect feature already enabled"
+        fi
+    else
+        log "WARN" "authselect command not found, using pam_faillock directly"
+    fi
+
+# Update faillock configuration
+for param in "${!FAILLOCK_CONFIG[@]}"; do
+    local value="${FAILLOCK_CONFIG[$param]}"
+
+    if grep -q "^$param" "$faillock_conf"; then
+        if [[ -z "$value" ]]; then
+            if sed -i "s/^$param.*/$param/" "$faillock_conf"; then
+                log "DEBUG" "Updated faillock configuration: $param"
+            else
+                log "ERROR" "Failed to update faillock configuration $param"
+            fi
+        else
+            if sed -i "s/^$param.*/$param = $value/" "$faillock_conf"; then
+                log "DEBUG" "Updated faillock configuration: $param = $value"
+            else
+                log "ERROR" "Failed to update faillock configuration $param"
+            fi
+        fi
+    else
+        # 处理没有值的参数
+        if [[ -z "$value" ]]; then
+            echo "$param" >> "$faillock_conf"
+            log "DEBUG" "Added faillock configuration: $param"
+        else
+            echo "$param = $value" >> "$faillock_conf"
+            log "DEBUG" "Added faillock configuration: $param = $value"
+        fi
+    fi
+done
+
+    # Apply changes (no direct service to reload for faillock)
+    log "INFO" "Faillock configuration updated (changes may require reauthentication to take effect)"
+}
+
+# Select YMTC Fab Environment
+select_yamtc_fab() {
+    local valid_indexes=()
+    local disp real_idx choice
+    local i count=0
+
+    # 只收集 ACTIVE=1 的分区索引
+    for i in 0 1 2 3 4 5 6 7; do
+        if [ "${FAB_ACTIVE[$i]}" = "1" ]; then
+            valid_indexes[$count]="$i"
+            count=$((count + 1))
+        fi
+    done
+
+
+    # 清屏并显示选择菜单
+    clear
+    # echo "============================================"
+    echo "     YMTC Fab Environment Configuration"
+    echo "============================================"
+    echo
+    echo "  请选择当前 Fab 分区："
+    echo
+    for disp in "${!valid_indexes[@]}"; do
+        real_idx="${valid_indexes[$disp]}"
+        echo -e "   ${FAB_COLORS[$real_idx]}$((disp + 1))) ${FAB_NAMES[$real_idx]}${NC}"
+    done
+    echo
+    
+    while true; do
+        read -p "  输入选项 [1-${#valid_indexes[@]}]: " choice
+        choice=$((choice - 1))
+        if [ "$choice" -ge 0 ] && [ "$choice" -lt "${#valid_indexes[@]}" ]; then
+            break
+        fi
+        echo -e "${RED}[错误] 无效选项，请重新输入。${NC}"
+    done
+
+    # 映射回真实数组索引并存入全局变量
+    FAB_SELECTED_IDX="${valid_indexes[$choice]}"
+    log "INFO" "用户选择了 Fab 分区: ${FAB_NAMES[$FAB_SELECTED_IDX]}"
+}
+
+# Configure SSH service
+configure_ssh() {
+    local sshd_conf="/etc/ssh/sshd_config"
+
+    backup_file "$sshd_conf"
+
+    # Update SSH configuration
+    for param in "${!SSHD_CONFIG[@]}"; do
+        local value="${SSHD_CONFIG[$param]}"
+
+        if grep -q "^$param" "$sshd_conf"; then
+            if sed -i "s/^$param.*/$param $value/" "$sshd_conf"; then
+                log "DEBUG" "Updated SSH configuration: $param $value"
+            else
+                log "ERROR" "Failed to update SSH configuration $param"
+            fi
+        else
+            echo "$param $value" >> "$sshd_conf"
+            log "DEBUG" "Added SSH configuration: $param $value"
+        fi
+    done
+
+    if systemctl reload sshd; then
+        log "INFO" "Reloaded SSH service"
+    else
+        log "ERROR" "Failed to reload SSH service"
+    fi
+}
+
+# Configure system banner
+configure_banner() {
+    local profile_script="/etc/profile.d/yamtc-fab.sh"
+    log "INFO" "正在配置 YMTC Fab 登录 Banner..."
+    
+    # 清除所有用户 ~/.bashrc 里残留的旧 YMTC 块
+    for home_dir in /root /home/*; do
+        if [ -f "$home_dir/.bashrc" ]; then
+            sed -i '/# === YMTC BEGIN ===/,/# === YMTC END ===/d' "$home_dir/.bashrc" 2>/dev/null
+        fi
+    done
+
+    # 写入全局模板配置
+    cat > "$profile_script" <<'TEMPLATE'
+# === YMTC FAB GLOBAL BEGIN ===
+case $- in *i*) ;; *) return;; esac
+clear
+echo -e '__FAB_COLOR__##############################################__NC_COLOR__'
+echo -e '__FAB_COLOR__        __FAB_NAME__ Production Environment__NC_COLOR__'
+echo -e '__FAB_COLOR__                Authorized user only.__NC_COLOR__'
+echo -e '__FAB_COLOR__All activity may be monitored and reported.__NC_COLOR__'
+echo -e '__FAB_COLOR__##################################################__NC_COLOR__'
+# === YMTC FAB GLOBAL END ===
+TEMPLATE
+
+    # 安全转义替换
+    local fab_color_safe="${FAB_COLORS[$FAB_SELECTED_IDX]//\\/\\\\}"
+    local nc_safe="${NC//\\/\\\\}"
+
+    sed -i \
+        -e "s|__FAB_COLOR__|${fab_color_safe}|g" \
+        -e "s|__NC_COLOR__|${nc_safe}|g" \
+        -e "s|__FAB_TAG__|${FAB_TAGS[$FAB_SELECTED_IDX]}|g" \
+        -e "s|__FAB_NAME__|${FAB_NAMES[$FAB_SELECTED_IDX]}|g" \
+        "$profile_script"
+
+    chmod +x "$profile_script"
+    > /etc/motd   # 清空系统默认 motd，避免重复显示
+    log "INFO" "成功配置 ${FAB_NAMES[$FAB_SELECTED_IDX]} 登录 Banner"
+}
+
+# Configure logrotate rotation policy
+configure_logrotate() {
+    local logrotate_conf="/etc/logrotate.conf"
+    local expected_rotate="$LOGROTATE_ROTATE"
+    
+    backup_file "$logrotate_conf"
+    
+    # Get current rotation value
+    local current_rotate=$(awk '/^rotate/ {print $2}' "$logrotate_conf" 2>/dev/null)
+    
+    if [[ -z "$current_rotate" ]]; then
+        log "WARN" "No existing 'rotate' directive found in $logrotate_conf"
+        echo "rotate $expected_rotate" >> "$logrotate_conf"
+        log "INFO" "Added 'rotate $expected_rotate' to $logrotate_conf"
+    elif [[ "$current_rotate" -ne "$expected_rotate" ]]; then
+        if sed -i "s/^rotate.*/rotate $expected_rotate/" "$logrotate_conf"; then
+            log "INFO" "Updated log rotation from $current_rotate to $expected_rotate in $logrotate_conf"
+        else
+            log "ERROR" "Failed to update rotate setting in $logrotate_conf"
+            return 1
+        fi
+    else
+        log "DEBUG" "Log rotation already set to $expected_rotate, no changes needed"
+    fi
+}
+
+# Configure rsyslog for command history logging
+configure_rsyslog_history() {
+    local rsyslog_conf="/etc/rsyslog.conf"
+    local history_log="/var/log/history"
+    local config_line="local1.* $history_log"
+    
+    backup_file "$rsyslog_conf"
+    
+    # Check if configuration already exists
+    if grep -qE "^\s*local1\.\*\s+$history_log" "$rsyslog_conf"; then
+        log "DEBUG" "rsyslog history logging already configured, skipping"
+        return 0
+    fi
+    
+    # Add configuration
+    echo "$config_line" >> "$rsyslog_conf"
+    log "INFO" "Added command history logging to $rsyslog_conf"
+    
+    # Create history log file with proper permissions
+    touch "$history_log" && \
+    chmod 600 "$history_log" && \
+    chown root:root "$history_log"
+    
+    if [[ $? -ne 0 ]]; then
+        log "ERROR" "Failed to setup history log file"
+        return 1
+    fi
+    
+    # Restart rsyslog service
+    if systemctl restart rsyslog >/dev/null 2>&1; then
+        log "INFO" "Restarted rsyslog service"
+    else
+        log "ERROR" "Failed to restart rsyslog service"
+        return 1
+    fi
+    
+    # Add logrotate entry for history log
+    local logrotate_dir="/etc/logrotate.d"
+    local history_rotate="$logrotate_dir/history"
+    
+    mkdir -p "$logrotate_dir"
+    cat > "$history_rotate" <<- EOF
+$history_log {
+    missingok
+    notifempty
+    daily
+    rotate $LOGROTATE_ROTATE
+    create 0600 root root
+}
+EOF
+    
+    log "INFO" "Created logrotate configuration for history log"
+}
+
+#Disable cron email
+configure_crond_args() {
+    # Define the configuration file path
+    local crond_file="/etc/sysconfig/crond"
+
+    backup_file "$crond_file"
+    
+    # Verify the configuration file exists
+    if [ ! -f "$crond_file" ]; then
+        echo "Error: Configuration file $crond_file not found" >&2
+        return 1
+    fi
+    
+    # Check if CRONDARGS parameter already exists
+    if grep -q '^CRONDARGS=' "$crond_file"; then
+        # Replace existing configuration with new value
+        sed -i 's/^CRONDARGS=.*/CRONDARGS="-m off"/' "$crond_file"
+    else
+        # Append new configuration to end of file
+        echo 'CRONDARGS="-m off"' >> "$crond_file"
+    fi
+    
+    # Confirm successful modification
+    echo "CRONDARGS has been updated to '-m off' in $crond_file"
+}
+
+# Configure PS1 prompt
+configure_ps1() {
+    local bashrc_file="/etc/bashrc"
+    backup_file "$bashrc_file"
+
+    if [[ "$(hostname)" =~ ^p ]]; then
+        log "INFO" "检测到主机名符合条件，正在配置彩色 PS1..."
+        
+        # 清除 /etc/bashrc 里残留的旧 PS1 块
+        sed -i '/# === YMTC PS1 BEGIN ===/,/# === YMTC PS1 END ===/d' "$bashrc_file" 2>/dev/null
+        
+        # 追加新配置模板到末尾
+        cat >> "$bashrc_file" <<'TEMPLATE'
+# === YMTC PS1 BEGIN ===
+PS1=$'\[__FAB_COLOR__\][\u@\h __FAB_TAG__ \W]\$\[__NC_COLOR__\] '
+# === YMTC PS1 END ===
+TEMPLATE
+
+        # 安全转义替换
+        local fab_color_safe="${FAB_COLORS[$FAB_SELECTED_IDX]//\\/\\\\}"
+        local nc_safe="${NC//\\/\\\\}"
+
+        sed -i \
+            -e "s|__FAB_COLOR__|${fab_color_safe}|g" \
+            -e "s|__NC_COLOR__|${nc_safe}|g" \
+            -e "s|__FAB_TAG__|${FAB_TAGS[$FAB_SELECTED_IDX]}|g" \
+            "$bashrc_file"
+            
+        log "INFO" "成功配置 PS1 变量为 [${FAB_TAGS[$FAB_SELECTED_IDX]}] 样式"
+    else
+        log "DEBUG" "Hostname doesn't start with 'p', skipping PS1 configuration"
+    fi
+}
+
+# Configure profile environment variables
+configure_profile() {
+    local profile_file="/etc/profile"
+
+#    backup_file "$profile_file"
+
+    # Temporarily load profile file
+    source "$profile_file" || {
+        log "WARN" "Failed to load profile file"
+        return 1
+    }
+
+    for line in "${ETC_PROFILE_CONFIG[@]}"; do
+        local item="${line%%=*}"
+        local value="${line#*=}"
+        local current_value
+
+        # Safely get variable value
+        if declare -p "$item" &>/dev/null; then
+            current_value=$(eval "echo \"\$$item\"")
+        else
+            current_value=""
+        fi
+
+        # Remove possible quotes for comparison
+        local unquoted_value=$(eval "echo $value")
+        local unquoted_current=$(eval "echo $current_value")
+
+        if [[ "$unquoted_current" != "$unquoted_value" ]]; then
+            # Remove old configuration
+            sed -i "/^export\s\+${item}=/d" "$profile_file"
+            # Add new configuration
+            echo "export ${item}=${value}" >> "$profile_file" && \
+            log "INFO" "Configured profile environment variable: ${item}=${value}"
+        else
+            log "DEBUG" "Profile environment variable ${item} already configured, skipping"
+        fi
+    done
+}
+
+# Configure PROMPT_COMMAND
+configure_prompt_command() {
+    local profile_file="/etc/profile"
+
+#    backup_file "$profile_file"
+
+    # Temporarily load profile file
+    source "$profile_file" || {
+        log "WARN" "Failed to load profile file"
+        return 1
+    }
+
+    # Standardize comparison by removing extra spaces and quotes
+    local current_pc=$(eval "echo \"$PROMPT_COMMAND\"")
+    local new_pc=$(eval "echo \"$PROMPT_COMMAND_SCRIPT\"")
+
+    if [[ "$current_pc" != "$new_pc" ]]; then
+        # Remove old configuration
+        sed -i '/^\s*[^#]*PROMPT_COMMAND=/d' "$profile_file"
+        # Add new configuration
+        echo "export PROMPT_COMMAND='$PROMPT_COMMAND_SCRIPT'" >> "$profile_file" && \
+        log "INFO" "Configured PROMPT_COMMAND"
+    else
+        log "DEBUG" "PROMPT_COMMAND already configured, skipping"
+    fi
+}
+
+# Configure yum repositories
+configure_yum_repo() {
+    local repo_file="/etc/yum.repos.d/base.repo"
+    local os_type
+    #clean current yum config
+    mkdir /etc/yum.repos.d/repo_bak
+    mv /etc/yum.repos.d/*.repo /etc/yum.repos.d/repo_bak
+
+
+    if grep -q "Red Hat Enterprise Linux" /etc/os-release; then
+        os_type="rhel"
+    elif grep -q "Rocky Linux" /etc/os-release; then
+        os_type="rocky"
+    else
+        log "ERROR" "Unable to determine OS type"
+        return 1
+    fi
+
+    backup_file "$repo_file"
+
+    cat > "$repo_file" << EOF
+[BaseOS]
+name=BaseOS
+baseurl=http://10.129.36.250/${os_type}810/BaseOS
+gpgcheck=0
+enabled=1
+
+[AppStream]
+name=AppStream
+baseurl=http://10.129.36.250/${os_type}810/AppStream
+gpgcheck=0
+enabled=1
+EOF
+# install iostat tool
+    rm -fr /etc/yum.repos.d/Rocky-*.repo
+    yum clean all
+    yum makecache
+    yum install -y sysstat
+
+    log "INFO" "Configured YUM repositories"
+}
+
+# Disable USB storage
+disable_usb_storage() {
+    local modprobe_conf="/etc/modprobe.d/usb-storage.conf"
+
+    if echo "install usb-storage /bin/true" > "$modprobe_conf"; then
+        log "INFO" "Disabled USB storage"
+    else
+        log "ERROR" "Failed to disable USB storage"
+    fi
+}
+
+# Disable Ctrl+Alt+Del
+disable_ctrl_alt_del() {
+    systemctl disable ctrl-alt-del.target
+    if systemctl mask ctrl-alt-del.target >/dev/null; then
+        log "INFO" "Disabled Ctrl+Alt+Del key combination"
+    else
+        log "ERROR" "Failed to disable Ctrl+Alt+Del"
+    fi
+}
+
+# enable_network_lldp
+enable_network_lldp() {
+    virt_type=$(systemd-detect-virt 2>/dev/null || true)
+    log "INFO" "检测虚拟化环境: virt_type=[${virt_type:-空}]"
+    if [ "$virt_type" = "none" ]; then
+        log "INFO" "物理机，开始下载并执行 enable_lldp.sh"
+        if wget -nv -O /tmp/enable_lldp.sh http://10.129.36.250/scripts/enable_lldp.sh; then
+            chmod +x /tmp/enable_lldp.sh
+            bash /tmp/enable_lldp.sh
+            rc=$?
+            rm -rf /tmp/enable_lldp.sh
+            if [ "$rc" -eq 0 ]; then
+                log "INFO" "LLDP 配置执行完成"
+            else
+                log "ERROR" "enable_lldp.sh 执行失败 (退出码=$rc)"
+            fi
+        else
+            log "ERROR" "wget 下载失败，请检查网络或脚本地址 http://10.129.36.250/scripts/enable_lldp.sh"
+        fi
+    else
+        log "INFO" "检测到虚拟机 (${virt_type})，跳过 LLDP 配置"
+    fi
+}
+
+# Cleanup work
+cleanup() {
+    exec 1>&3 2>&4
+    log "INFO" "System configuration completed, some settings require reboot to take effect"
+    log "INFO" "Detailed logs available at: $LOG_FILE"
+    log "INFO" "Configuration file backups in: $BACKUP_DIR"
+}
+
+###########################################
+# Main Function
+###########################################
+
+main() {
+    # Initialization
+	select_yamtc_fab
+    init_logging
+    check_root
+    create_backup
+    check_os_version
+
+    # Execute configurations
+    create_users
+    configure_sudo
+    disable_selinux
+    configure_runlevel
+    configure_time
+    configure_services
+    configure_limits
+    configure_sysctl
+    configure_password_policy
+    configure_faillock
+    configure_ssh
+    configure_banner
+    configure_logrotate
+    configure_rsyslog_history
+    configure_crond_args
+    configure_ps1
+    configure_profile
+    configure_prompt_command
+    configure_yum_repo
+    disable_usb_storage
+    disable_ctrl_alt_del
+	enable_network_lldp
+
+    # Cleanup and summary
+    cleanup
+}
+
+# Execute main function
+main "$@"
+
+
+
+
+333333333333333333333333rhel79_setup
+#!/bin/bash
+# 本脚本适用于新装RHEL7/CentOS7系统的规范设置
+# 请谨慎用于已配置过相关参数的RHEL系统
+# 部分设置可能需重启系统生效
+# 调用本脚本自动化执行，需加参数'yes'
+# version: 0.1
+# version: 0.1
+# wenhuang@redhat.com
+# 2021/9/28
+
+# ==============================================================================
+#  YMTC Fab Environment Configuration (Added)
+# ==============================================================================
+readonly FAB_NC='\033[0m'
+readonly FAB_COLORS=(
+    '\033[0;31m'   # FAB1 - 红色
+    '\033[0;32m'   # FAB2 - 绿色
+    '\033[0;33m'   # FAB3 - 黄色
+    '\033[0;34m'   # FABR - 蓝色
+    '\033[0;35m'   # FAB5 - 紫色（预留）
+    '\033[0;36m'   # FAB6 - 青色（预留）
+    '\033[0;90m'   # FAB7 - 灰色（预留）
+    '\033[0;37m'   # FAB8 - 白色（预留）
+)
+readonly FAB_TAGS=(FAB1 FAB2 FAB3 FABR EXT1 EXT2 EXT3 EXT4)
+readonly FAB_NAMES=(
+    "YMTC Fab1"
+    "YMTC Fab2"
+    "YMTC Fab3"
+    "YMTC FabR"
+    "FAB Partition 5"
+    "FAB Partition 6"
+    "FAB Partition 7"
+    "FAB Partition 8"
+)
+readonly FAB_ACTIVE=(1 1 1 1 0 0 0 0)
+
+# 全局变量：存储用户选择的索引
+FAB_SELECTED_IDX=""
+
+select_yamtc_fab() {
+    local valid_indexes=()
+    local disp real_idx choice
+    local i count=0
+
+    # 只收集 ACTIVE=1 的分区索引
+    for i in 0 1 2 3 4 5 6 7; do
+        if [ "${FAB_ACTIVE[$i]}" = "1" ]; then
+            valid_indexes[$count]="$i"
+            count=$((count + 1))
+        fi
+    done
+
+    # 清屏并显示选择菜单
+    clear
+    echo "============================================"
+    echo "     YMTC Fab Environment Configuration"
+    echo "============================================"
+    echo
+    echo "  请选择当前 Fab 分区："
+    echo
+    for disp in "${!valid_indexes[@]}"; do
+        real_idx="${valid_indexes[$disp]}"
+        echo -e "   ${FAB_COLORS[$real_idx]}$((disp + 1))) ${FAB_NAMES[$real_idx]}${FAB_NC}"
+    done
+    echo
+    
+    while true; do
+        read -p "  输入选项 [1-${#valid_indexes[@]}]: " choice
+        choice=$((choice - 1))
+        if [ "$choice" -ge 0 ] && [ "$choice" -lt "${#valid_indexes[@]}" ]; then
+            break
+        fi
+        echo -e "\033[1;31m[错误] 无效选项，请重新输入。\033[0m"
+    done
+
+    FAB_SELECTED_IDX="${valid_indexes[$choice]}"
+}
+
+create_user() {
+    if ! getent group $group >/dev/null; then
+        groupadd -g $groupid $group
+        echo "Created group '$group'"
+    fi
+    if ! id $user >/dev/null 2>&1; then
+        useradd -u $userid -g $group -s /bin/bash $user
+        echo "$user:$password" |chpasswd
+        echo "Created user '$user' in group '$group'"
+	userdel -r osinstall
+        # passwd -e $user >/dev/null 2>&1
+        # echo "Set password must be changed at the next login for '$user'"
+    fi
+}
+
+set_sudo() {
+    local file='/etc/sudoers'
+    if ! egrep -q "^\s*$user\s+ALL=\(ALL\)\s+NOPASSWD:\s+ALL" $file; then
+        echo "$user ALL=(ALL) NOPASSWD: ALL" >> $file
+        echo "Set '$user ALL=(ALL) NOPASSWD: ALL' in $file"
+    fi
+}
+
+set_fstab() {
+    local file='/etc/fstab'
+    while read line; do
+        changed=()
+        item=` awk '{print $1}' <<< "$line" `
+        value=` awk '{print $2}' <<< "$line" `
+        if egrep -q "^[^#]*\s+$item\s+" $file ; then
+            for v in ${value//,/ }; do
+                if ! egrep -q "^[^#]*\s+$item\s+.*$v" $file; then
+                    sed -ri "s@(^[^#]*\s+$item\s+.*defaults)(.*)@\1,$v\2@" $file
+                    changed+=($v)
+                fi
+            done
+        fi
+
+        if [ ${#changed[@]} -gt 0 ]; then
+            echo "Set '$item $(echo ${changed[@]} | sed 's/\s/,/g')' in $file"
+        fi
+    done <<< "$etc_fstab"
+}
+
+disable_selinux() {
+    local file='/etc/selinux/config'
+    if ! grep -q "^\s*SELINUX=$selinux" $file; then
+         sed -i "s/^\s*SELINUX=.*/SELINUX=$selinux/" $file
+         echo "Set 'SELINUX=$selinux' in $file"
+         
+    fi
+}
+
+set_runlevel() {
+    if [ $(systemctl get-default) != "$runlevel" ]; then
+        systemctl set-default $runlevel > /dev/null 2>&1
+        echo "Set runlevel '$runlevel'"
+    fi
+}
+
+grub2_mkconfig() {
+    if [ -d /sys/firmware/efi ]; then
+        local file='/boot/efi/EFI/redhat/grub.cfg'
+    else
+        local file='/boot/grub2/grub.cfg'
+    fi
+    grub2-mkconfig -o $file > /dev/null 2>&1
+    echo "Maked grub2 config to $file"
+}
+
+disable_ipv6() {
+    # if grep -q "ipv6.disable=1" /proc/cmdline; then
+    #     return
+    # fi
+    local file='/etc/default/grub'
+    if ! grep -q '^GRUB_CMDLINE_LINUX=.*ipv6.disable=1.*' $file; then
+        sed -ri 's/(^GRUB_CMDLINE_LINUX=".*)"/\1 ipv6.disable=1"/' $file
+        echo "Set 'ipv6.disable=1' in $file"
+        grub2_mkconfig
+    fi
+}
+
+set_timezone() {
+    if ! timedatectl status |grep 'Time zone' |grep -q "$timezone"; then
+        timedatectl set-timezone $timezone
+        echo "Set timezone '$timezone'"
+    fi
+}
+
+set_chrony() {
+    local file="/etc/chrony.conf"
+    s1=$(egrep -o "^\s*server\s+([^#]+)" $file | sed 's/\s*$//' | sort -n | tr '\n' ',' | sed 's/,$//')
+    s2=$(echo "$chrony_sources" | sort -n | tr '\n' ',' | sed 's/,$//')
+    if [ "$s1" != "$s2" ]; then
+        sed -ri '/^\s*pool\s+/d' $file
+        sed -ri '/^\s*server\s+/d' $file
+        echo "$chrony_sources" >> $file
+        systemctl restart chronyd > /dev/null 2>&1
+        echo "Set '$chrony_sources' in $file"
+    fi
+}
+
+enable_kdump() {
+    # if grep -qw 'crashkernel' /proc/cmdline; then
+    #     return
+    # fi
+    local file='/etc/default/grub'
+    if ! grep -q '^\s*GRUB_CMDLINE_LINUX.*crashkernel' $file ; then
+        sed -ri 's/(^GRUB_CMDLINE_LINUX=".*)"/\1 crashkernel=auto"/' $file
+        echo "Set 'crashkernel=auto' in $file"
+        grub2_mkconfig
+    fi
+}
+
+set_cron_user() {
+    local file='/etc/cron.allow'
+    if [ ! -f $file ]; then
+        echo -e "root\n$user" > $file
+        chmod 600 $file
+        echo "Set 'root, $user' in $file"
+    fi
+}
+
+set_cron_mail() {
+    local file='/etc/crontab'
+    if ! grep -q -e ^MAILTO=\"\" -e ^MAILTO=\'\' $file; then
+        sed -i 's/^MAILTO=.*/MAILTO=""/' $file
+        echo "Set 'MAILTO=\"\"' in $file"
+    fi
+}
+
+set_service() {
+    for s in $services_on; do
+        if systemctl list-unit-files |grep -q -w $s; then
+            if ! systemctl is-enabled $s >/dev/null 2>&1; then
+                systemctl enable $s >/dev/null 2>&1
+                echo "Enabled service '$s'"
+            fi
+            if ! systemctl is-active $s >/dev/null 2>&1; then
+                systemctl start $s >/dev/null 2>&1
+                echo "Started service '$s'"
+            fi
+        fi
+    done
+
+    for s in $services_off; do
+        if systemctl list-unit-files |grep -q -w $s; then
+            if systemctl is-enabled $s >/dev/null 2>&1; then
+                systemctl disable $s >/dev/null 2>&1
+                echo "Disabled service '$s'"
+            fi
+            if systemctl is-active $s >/dev/null 2>&1; then
+                systemctl stop $s >/dev/null 2>&1
+                echo "Stopped service '$s'"
+            fi
+        fi
+    done
+}
+
+set_ulimit() {
+    local file="/etc/security/limits.conf"
+    local file_nproc="/etc/security/limits.d/20-nproc.conf"
+    while read line; do
+        domain=` awk '{print $1}' <<< "$line" `
+        type=` awk '{print $2}' <<< "$line" `
+        item=` awk '{print $3}' <<< "$line" `
+        value=` awk '{print $4}' <<< "$line" `
+
+        if [ $"$domain" == "*" ]; then
+            if ! egrep -q "^\s*\*\s+$type\s+$item\s+$value\b" $file; then
+                sed -ri "/^\s*\*\s+$type\s+$item\s+/d" $file
+                echo "$line" >> $file
+                echo "Set '$line' in $file"
+            fi
+            if [ -s $file_nproc ]; then
+                if egrep -q "^\s*\*\s+$type\s+$item\s+" $file_nproc; then
+                    echo "Commented '` egrep "^\s*\*\s+$type\s+$item\s+" $file_nproc `' in $file_nproc"
+                    sed -ri "s/(^\s*\*\s+$type\s+$item\s+.*)/#\1/" $file_nproc
+                fi
+            fi
+        else
+            if ! egrep -q "^\s*$domain\s+$type\s+$item\s+$value\b" $file; then
+                sed -ri "/^\s*$domain\s+$type\s+$item\s+/d" $file
+                echo "$line" >> $file
+                echo "Set '$line' in $file"
+            fi
+            if [ ! -s $file_nproc ]; then continue; fi
+            if egrep -q "^\s*$domain\s+$type\s+$item\s+" $file_nproc; then
+                echo "Commented '` egrep "^\s*$domain\s+$type\s+$item\s+" $file_nproc `' in $file_nproc"
+                sed -ri "s/(^\s*$domain\s+$type\s+$item\s+.*)/#\1/" $file_nproc
+            fi
+        fi
+    done <<< "$ulimit"
+}
+
+set_sysctl() {
+    local file='/etc/sysctl.conf'
+    while read line; do
+        item="${line% =*}"
+        value="${line#*= }"
+        if ! grep -qw "^\s*$item" $file; then
+            echo "$line" >> $file
+            echo "Set '$line' in $file"
+        else
+            v=` sed -rn "s/^\s*$item[ =]+//p" /etc/sysctl.conf `
+            if [ "$value" != "$v" ]; then
+                sed -ri "s/(^\s*$item[ =]+).*/\1$value/" $file
+                echo "Set '$line' in $file"
+            fi
+        fi
+    done <<< "$sysctl"
+    sysctl -p > /dev/null
+}
+
+set_password_age() {
+    local file='/etc/login.defs'
+    _pass_max_days=$(awk '/^PASS_MAX_DAYS/ {print $2}' $file)
+    if [ $_pass_max_days -ne $pass_max_days ]; then
+        sed -ri "s/(^PASS_MAX_DAYS\s+).*/\1$pass_max_days/" $file
+        echo "Set 'PASS_MAX_DAYS $pass_max_days' in $file"
+    fi
+    _pass_min_days=$(awk '/^PASS_MIN_DAYS/ {print $2}' $file)
+    if [ $_pass_min_days -ne $pass_min_days ]; then
+        sed -ri "s/(^PASS_MIN_DAYS\s+).*/\1$pass_min_days/" $file
+        echo "Set 'PASS_MIN_DAYS $pass_min_days' in $file"
+    fi
+    _pass_min_len=$(awk '/^PASS_MIN_LEN/ {print $2}' $file)
+    if [ $_pass_min_len -ne $pass_min_len ]; then
+        sed -ri "s/(^PASS_MIN_LEN\s+).*/\1$pass_min_len/" $file
+        echo "Set 'PASS_MIN_LEN $pass_min_len' in $file"
+    fi
+    _pass_warn_days=$(awk '/^PASS_WARN_AGE/ {print $2}' $file)
+    if [ $_pass_warn_days -ne $pass_warn_days ]; then
+        sed -ri "s/(^PASS_WARN_AGE\s+).*/\1$pass_warn_days/" $file
+        echo "Set 'PASS_WARN_AGE $pass_warn_days' in $file"
+    fi
+    
+    # users="root $user"
+    # for u in $users; do
+    #     _max_days=$(chage -l $u |awk '/^Maximum/ {print $NF}')
+    #     if [ $_max_days -ne $pass_max_days ]; then
+    #         chage -M $pass_max_days $u
+    #         echo "Set maximum password days '$pass_max_days' for '$u'"
+    #     fi
+    #     _min_days=$(chage -l $u |awk '/^Minimum/ {print $NF}')
+    #     if [ $_min_days -ne $pass_min_days ]; then
+    #         chage -m $pass_min_days $u
+    #         echo "Set minimum password days '$pass_min_days' for '$u'"
+    #     fi
+    #     _warn_days=$(chage -l $u |awk '/warning/ {print $NF}')
+    #     if [ $_warn_days -ne $pass_warn_days ]; then
+    #         chage -W $pass_warn_days $u
+    #         echo "Set warn password days '$pass_warn_days' for '$u'"
+    #     fi
+    # done
+}
+
+set_password_complex() {
+    # password    requisite     pam_pwquality.so try_first_pass local_users_only retry=3 authtok_type= enforce_for_root minlen=8 minclass=3 ucredit=0 lcredit=0 dcredit=0 ocredit=0
+    
+    local file="/etc/pam.d/system-auth /etc/pam.d/password-auth"
+    for f in $file; do
+        local item=()
+        for p in $password_complex; do
+            if ! egrep -q "^\s*password\s+requisite\s+pam_pwquality\.so\s+.*${p}\b" $f; then
+                if egrep -q "^\s*password\s+requisite\s+pam_pwquality\.so\s+.*${p%=*}" $f; then
+                    # replace
+                    sed -ri --follow-symlinks "/^\s*password\s+requisite\s+pam_pwquality\.so\s+/ s/${p%=*}=(-?[0-9]+)\b/${p}/" $f
+                    item+=($p)
+                else
+                    # append
+                    sed -ri --follow-symlinks "s/(^\s*password\s+requisite\s+pam_pwquality\.so\s+.*)/\1 ${p}/" $f
+                    item+=($p)
+                fi
+            fi
+        done
+
+        if [ ${#item[@]} -gt 0 ]; then
+            echo "Set '${item[@]}' in $f"
+        fi
+    done
+}
+
+set_password_history() {
+    # password    required     pam_pwhistory.so enforce_for_root remember=5
+
+    local file="/etc/pam.d/system-auth /etc/pam.d/password-auth"
+    pam_pwhistory="password    required      pam_pwhistory.so"
+
+    for f in $file; do
+        local item=()
+        if ! egrep  -q "^\s*password\s+(requisite|required)\s+pam_pwhistory\.so" $f; then
+            # insert
+            sed -ri --follow-symlinks "/^\s*password\s+requisite\s+pam_pwquality\.so/a $pam_pwhistory" $f
+        fi
+
+        for p in $password_history; do
+            if ! egrep  -q "^\s*password\s+(requisite|required)\s+pam_pwhistory\.so.*${p}\b" $f; then
+                if egrep  -q "^\s*password\s+(requisite|required)\s+pam_pwhistory\.so.*${p%=*}" $f; then
+                    # replace
+                    sed -ri --follow-symlinks "/^\s*password\s+(requisite|required)\s+pam_pwhistory\.so/ s/${p%=*}=(-?[0-9]+)\b/${p}/" $f
+                    item+=($p)
+                else
+                    # append
+                    sed -ri --follow-symlinks "s/(^\s*password\s+(requisite|required)\s+pam_pwhistory\.so.*)/\1 ${p}/" $f
+                    item+=($p)
+                fi
+            fi
+        done
+
+        if [ ${#item[@]} -gt 0 ]; then
+            echo "Set '${item[@]}' in $f"
+        fi
+    done
+}
+
+set_password_faillock() {
+    local file="/etc/pam.d/system-auth /etc/pam.d/password-auth"
+    faillock_preauth="auth        required      pam_faillock.so preauth silent audit"
+    faillock_authfail="auth        [default=die] pam_faillock.so authfail audit"
+    faillock_account="account     required      pam_faillock.so"
+
+    for f in $file; do
+        local item=()
+        if ! egrep -q "^\s*auth\s+required\s+pam_faillock\.so" $f; then
+            # insert
+            sed -ri --follow-symlinks "/^\s*auth\s+sufficient\s+pam_unix\.so/i $faillock_preauth" $f
+        fi
+        if ! egrep -q "^\s*auth\s+\[default\=die\]\s+pam_faillock\.so" $f; then
+            # insert
+            sed -ri --follow-symlinks "/^\s*auth\s+sufficient\s+pam_unix\.so/a $faillock_authfail" $f
+        fi
+        if ! egrep -q "^\s*account\s+required\s+pam_faillock\.so" $f; then
+            # insert
+            sed -ri --follow-symlinks "/^\s*account\s+required\s+pam_unix\.so/i $faillock_account" $f
+        fi
+
+        for p in $password_faillock; do
+            if ! egrep -q "^\s*auth\s+required\s+pam_faillock\.so\s+.*${p}\b" $f; then
+                if egrep -q "^\s*auth\s+required\s+pam_faillock\.so\s+.*${p%=*}=(-?[0-9]+)\b" $f; then
+                    # replace
+                    sed -ri --follow-symlinks "/^\s*auth\s+required\s+pam_faillock\.so\s+/ s/${p%=*}=(-?[0-9]+)\b/${p}/" $f
+                    item+=($p)
+                else
+                    # append
+                    sed -ri --follow-symlinks "s/(^\s*auth\s+required\s+pam_faillock\.so\s+.*)/\1 ${p}/" $f
+                    item+=($p)
+                fi
+            fi
+
+            if ! egrep -q "^\s*auth\s+\[default\=die\]\s+pam_faillock\.so\s+.*${p}\b" $f; then
+                if egrep -q "^\s*auth\s+\[default\=die\]\s+pam_faillock\.so\s+.*${p%=*}=(-?[0-9]+)\b" $f; then
+                    # replace
+                    sed -ri --follow-symlinks "/^\s*auth\s+\[default\=die\]\s+pam_faillock\.so\s+/ s/${p%=*}=(-?[0-9]+)\b/${p}/" $f
+                    item+=($p)
+                else
+                    # append
+                    sed -ri --follow-symlinks "s/(^\s*auth\s+\[default\=die\]\s+pam_faillock\.so\s+.*)/\1 ${p}/" $f
+                    item+=($p)
+                fi
+            fi
+        done
+
+        if [ ${#item[@]} -gt 0 ]; then
+            readarray -t array <<< "$(for i in "${item[@]}"; do echo "$i"; done | uniq)"
+            echo "Set '${array[@]}' in $f"
+        fi
+    done
+}
+
+set_banner() {
+    local profile_script="/etc/profile.d/yamtc-fab.sh"
+    echo "Configuring YMTC Fab Login Banner..."
+    
+    # 清除所有用户 ~/.bashrc 里残留的旧 YMTC 块
+    for home_dir in /root /home/*; do
+        if [ -f "$home_dir/.bashrc" ]; then
+            sed -i '/# === YMTC BEGIN ===/,/# === YMTC END ===/d' "$home_dir/.bashrc" 2>/dev/null
+        fi
+    done
+
+    # 写入全局模板配置
+    cat > "$profile_script" <<'TEMPLATE'
+# === YMTC FAB GLOBAL BEGIN ===
+case $- in *i*) ;; *) return;; esac
+clear
+echo -e '__FAB_COLOR__##############################################__NC_COLOR__'
+echo -e '__FAB_COLOR__        __FAB_NAME__ Production Environment__NC_COLOR__'
+echo -e '__FAB_COLOR__                Authorized user only.__NC_COLOR__'
+echo -e '__FAB_COLOR__All activity may be monitored and reported.__NC_COLOR__'
+echo -e '__FAB_COLOR__##################################################__NC_COLOR__'
+# === YMTC FAB GLOBAL END ===
+TEMPLATE
+
+    # 安全转义替换
+    local fab_color_safe="${FAB_COLORS[$FAB_SELECTED_IDX]//\\/\\\\}"
+    local nc_safe="${FAB_NC//\\/\\\\}"
+
+    sed -i \
+        -e "s|__FAB_COLOR__|${fab_color_safe}|g" \
+        -e "s|__NC_COLOR__|${nc_safe}|g" \
+        -e "s|__FAB_NAME__|${FAB_NAMES[$FAB_SELECTED_IDX]}|g" \
+        "$profile_script"
+
+    chmod +x "$profile_script"
+    > /etc/motd   # 清空系统默认 motd
+    echo "Set banner for ${FAB_NAMES[$FAB_SELECTED_IDX]} successfully"
+}
+
+
+set_umask() {
+    local file="/etc/profile"
+    source $file
+    if [ $(umask) -ne $umask ]; then
+        sed -ri '/^umask\s+/d' $file
+        echo "umask $umask" >> $file
+        echo "Set 'umask $umask' in $file"
+    fi
+}
+
+set_ps1() {
+    local bashrc_file="/etc/bashrc"
+    echo "Configuring YMTC Fab Color PS1 Prompt..."
+    
+    # 清除 /etc/bashrc 里残留的旧 PS1 块
+    sed -i '/# === YMTC PS1 BEGIN ===/,/# === YMTC PS1 END ===/d' "$bashrc_file" 2>/dev/null
+    
+    # 追加新配置模板到末尾
+    cat >> "$bashrc_file" <<'TEMPLATE'
+# === YMTC PS1 BEGIN ===
+PS1=$'\[__FAB_COLOR__\][\u@\h __FAB_TAG__ \W]\$\[__NC_COLOR__\] '
+# === YMTC PS1 END ===
+TEMPLATE
+
+    # 安全转义替换
+    local fab_color_safe="${FAB_COLORS[$FAB_SELECTED_IDX]//\\/\\\\}"
+    local nc_safe="${FAB_NC//\\/\\\\}"
+
+    sed -i \
+        -e "s|__FAB_COLOR__|${fab_color_safe}|g" \
+        -e "s|__NC_COLOR__|${nc_safe}|g" \
+        -e "s|__FAB_TAG__|${FAB_TAGS[$FAB_SELECTED_IDX]}|g" \
+        "$bashrc_file"
+        
+    echo "Set PS1 to [${FAB_TAGS[$FAB_SELECTED_IDX]}] style successfully"
+}
+
+
+set_profile() {
+    local file=/etc/profile
+    source $file
+    while read line; do
+        item=`echo $line | cut -d= -f1`
+        value=`echo $line | cut -d= -f2`
+        eval v='$'{$item}
+        value=`eval echo $value`
+        if [ "$v" != "$value" ]; then
+            sed -ri "/^export\s+${item}=/d" $file
+            echo "export $line" >> $file
+            echo "Set 'export $line' in $file"
+        fi
+    done <<< "$etc_profile"
+}
+
+set_prompt_command() {
+    local file=/etc/profile
+    source $file
+    if [ "$PROMPT_COMMAND" != "$prompt_command" ]; then
+        sed -ri "/^\s*[^#]*PROMPT_COMMAND=/d" /etc/profile
+        echo "export PROMPT_COMMAND='$prompt_command'" >> $file
+        echo "Set 'export PROMPT_COMMAND' in $file"
+    fi
+}
+
+set_sshd() {
+    local file='/etc/ssh/sshd_config'
+    local changed=0
+    while read line; do
+        item=` echo $line | cut -d' ' -f1 `
+        value=` echo $line | cut -d' ' -f2 `
+        # v=` sshd -T |grep -wi $item |awk '{print $2}' `
+        v=` egrep -i "^\s*$item\s+" $file |awk '{print $2}' `
+        if [ "$v" != "$value" ]; then
+            sed -ri "/^\s*$item\s+/Id" $file
+            echo $line >> $file
+            echo "Set: '$line' in $file"
+            changed=1
+        fi
+    done <<< "$sshd_config"
+
+    if [ $changed -eq 1 ]; then
+        systemctl reload sshd > /dev/null 2>&1
+        echo "Reloaded sshd service"
+    fi
+}
+
+set_logrotate() {
+    local file='/etc/logrotate.conf'
+    r=$(awk '/^rotate/ {print $2}' $file)
+    if [ $r -ne $logrotate ]; then
+        sed -i "s/^rotate.*/rotate $logrotate/" $file
+        echo "Set 'rotate $logrotate' in $file"
+    fi
+}
+
+set_rsyslog() {
+    local file='/etc/rsyslog.conf'
+    if ! egrep -q "^\s*local1\.\*\s+/var/log/history" $file; then
+        echo "local1.* /var/log/history" >> $file
+        echo "Set 'local1.* /var/log/history' in $file"
+        systemctl restart rsyslog > /dev/null 2>&1
+        echo "Restarted rsyslog service"
+    fi
+}
+
+set_auditd() {
+    local file="/etc/audit/auditd.conf"
+    local changed=0
+    while read line; do
+        item=` awk -F '[ =]+' '{print $1}' <<< "$line" `
+        value=` awk -F '[ =]+' '{print $2}' <<< "$line" `
+        v=` grep "^\s*$item\b" $file | awk -F '[ =]+' '{print $2}' `
+        if [ -z "$v" ]; then
+            echo "$line" >> $file
+            echo "Set '$line' in $file"
+            changed=1
+        elif [ "$v" != "$value" ]; then
+            sed -i "s/^$item\b.*/$line/" $file
+            echo "Set '$line' in $file"
+            changed=1
+        fi
+    done <<< "$auditd_conf"
+
+    if [ $changed -eq 1 ]; then
+        service auditd reload > /dev/null
+        echo "Reloaded auditd service"
+    fi
+}
+
+set_audit_rules() {
+    local file='/etc/audit/rules.d/audit.rules'
+    local changed=0
+
+    while read line; do
+        if ! grep -q -- "$line" $file; then
+            echo "$line" >> $file
+            echo "Set '$line' in $file"
+            changed=1
+        fi
+    done <<< "$audit_rules"
+
+    if [ $changed -eq 1 ]; then
+        service auditd reload > /dev/null
+        echo "Reloaded auditd service"
+    fi
+}
+
+set_yum() {
+    # baseos
+    if grep -qw "Red Hat" /etc/redhat-release; then
+        OS=rhel
+    elif grep -qw "CentOS" /etc/redhat-release; then
+        OS=centos
+    else
+        return
+    fi
+    VERSION=` grep -o "[1-9]\.[1-9]" /etc/redhat-release |sed 's/\.//' `
+    OSVERSION="${OS}${VERSION}"
+
+    local file='/etc/yum.repos.d/base.repo'
+    if [ $rhel_num -eq 7 -a ! -s $file ]; then
+        cat <<EOF > $file
+[BaseOS]
+name=BaseOS
+baseurl=http://10.129.36.250/$OSVERSION
+gpgcheck=0
+enabled=1
+EOF
+        echo "Set yum repository '$file'"
+    elif [ $rhel_num -eq 8 -a ! -s $file ]; then
+        cat <<EOF > $file
+[BaseOS]
+name=BaseOS
+baseurl=http://10.129.36.250/$OSVERSION/BaseOS
+gpgcheck=0
+enabled=1
+
+[AppStream]
+name=AppStream
+baseurl=http://10.129.36.250/$OSVERSION/AppStream
+gpgcheck=0
+enabled=1
+EOF
+    fi
+
+    # epel
+    local file='/etc/yum.repos.d/epel.repo'
+    if [ $rhel_num -eq 7 -a ! -s $file ]; then
+        cat <<EOF > $file
+[epel7]
+name=epel7
+baseurl=http://10.129.36.250/epel/7/epel
+gpgcheck=0
+enabled=1
+EOF
+        echo "Set yum repository '$file'"
+    elif [ $rhel_num -eq 8 -a ! -s $file ]; then
+        cat <<EOF > $file
+[epel8]
+name=epel8
+baseurl=http://10.129.36.250/epel/8/epel
+gpgcheck=0
+enabled=1
+EOF
+        echo "Set yum repository '$file'"
+    fi
+}
+
+disable_usb() {
+    local file='/etc/modprobe.d/usb-storage.conf'
+    if ! grep -q '^install usb-storage /bin/true' /etc/modprobe.d/*.conf; then
+        echo 'install usb-storage /bin/true' > $file
+        echo "Set 'install usb-storage /bin/true' in $file"
+    fi
+}
+
+disable_ctrl_alt_del() {
+    if [ $(systemctl is-enabled ctrl-alt-del.target) != 'masked' ]; then
+        systemctl mask ctrl-alt-del.target >/dev/null 2>&1
+        echo "Disabled 'ctrl+alt+del' target" 
+    fi
+}
+
+
+# enable_network_lldp
+enable_network_lldp() {
+    virt_type=$(systemd-detect-virt 2>/dev/null || true)
+    log "INFO" "检测虚拟化环境: virt_type=[${virt_type:-空}]"
+    if [ "$virt_type" = "none" ]; then
+        log "INFO" "物理机，开始下载并执行 enable_lldp.sh"
+        if wget -nv -O /tmp/enable_lldp.sh http://10.129.36.250/scripts/enable_lldp.sh; then
+            chmod +x /tmp/enable_lldp.sh
+            bash /tmp/enable_lldp.sh
+            rc=$?
+            rm -rf /tmp/enable_lldp.sh
+            if [ "$rc" -eq 0 ]; then
+                log "INFO" "LLDP 配置执行完成"
+            else
+                log "ERROR" "enable_lldp.sh 执行失败 (退出码=$rc)"
+            fi
+        else
+            log "ERROR" "wget 下载失败，请检查网络或脚本地址 http://10.129.36.250/scripts/enable_lldp.sh"
+        fi
+    else
+        log "INFO" "检测到虚拟机 (${virt_type})，跳过 LLDP 配置"
+    fi
+}
+
+
+
+## Parameters
+user="sdbsman"
+userid="3009"
+group="sdbs"
+groupid="3001"
+password="Ljwc15yd#"
+
+selinux="disabled"
+runlevel="multi-user.target"
+timezone="Asia/Shanghai"
+logrotate=24
+# banner="###########################################\n       YMTC FAB 2 Production Environment\n         Authorized uses only. \nAll activity may be monitored and reported.\n###########################################"
+umask="027"
+ps1='\[\e[32;48m\][\u@\h \W]\\$ \[\e[m\]'
+# prompt_command=$'{ msg=$(history 1 | { read x y; echo "$y"; }); ip=$(who am i | awk \'{if (NF==4) {print $2} else {print $5}}\' | sed "s/[()]//g"); logger -p local1.debug "[$(whoami)@$ip $(pwd)] $msg"; }'
+prompt_command='{ msg=$(history 1 | { read x y; echo "$y"; }); ip=$(who am i | { read _ tty _ _ ip; [ -z "$ip" ] && ip=$tty; echo $ip | tr -d "()"; }); logger -p local1.debug "[$(whoami)@$ip $(pwd)] $msg"; }'
+
+pass_max_days=99999
+pass_min_days=0
+pass_min_len=8
+pass_warn_days=30
+password_complex="enforce_for_root minlen=8 minclass=4 maxsequence=3 maxrepeat=3 difok=5 ucredit=-1 dcredit=-1 ocredit=-1 lcredit=-1"
+password_history="enforce_for_root remember=3"
+password_faillock="deny=5 unlock_time=600" # for root, add 'even_deny_root'
+
+services_on="chronyd kdump rsyslog"
+services_off="auditd libvirtd fcoe iscsi iscsid bluetooth avahi-daemon acpid autofs cups firewalld ntpdate postfix rhnsd rhsmcertd smartd NetworkManager abrtd abrt-ccpp"
+
+etc_fstab="\
+/home nosuid
+/tmp noexec,nosuid,nodev
+/var/tmp noexec,nosuid,nodev"
+
+etc_profile='\
+TMOUT=900
+HISTSIZE=10000
+HISTFILESIZE=10000
+HISTTIMEFORMAT="%F %T "'
+
+sshd_config="\
+PermitEmptyPasswords no
+PermitRootLogin no
+GSSAPIAuthentication no
+UseDNS no"
+
+chrony_sources="\
+server 10.18.88.103 iburst"
+
+auditd_conf="\
+num_logs = 10
+max_log_file = 100
+flush = NONE"
+
+ulimit="\
+*    soft    nofile    65536
+*    hard    nofile    65536
+*    soft    nproc     65536
+*    hard    nproc     65536"
+
+sysctl="\
+vm.swappiness = 10
+net.ipv4.ip_forward = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1"
+
+# cd /usr/share/doc/audit-2.8.5/rules; grep ^[^#] -h 10-base-config.rules 30-stig.rules 99-finalize.rules
+audit_rules="\
+-D
+-b 8192
+-f 1
+-a always,exit -F arch=b32 -S adjtimex,settimeofday,stime -F key=time-change
+-a always,exit -F arch=b64 -S adjtimex,settimeofday -F key=time-change
+-a always,exit -F arch=b32 -S clock_settime -F a0=0x0 -F key=time-change
+-a always,exit -F arch=b64 -S clock_settime -F a0=0x0 -F key=time-change
+-w /etc/localtime -p wa -k time-change
+-w /etc/group -p wa -k identity
+-w /etc/passwd -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/security/opasswd -p wa -k identity
+-a always,exit -F arch=b32 -S sethostname,setdomainname -F key=system-locale
+-a always,exit -F arch=b64 -S sethostname,setdomainname -F key=system-locale
+-w /etc/issue -p wa -k system-locale
+-w /etc/issue.net -p wa -k system-locale
+-w /etc/hosts -p wa -k system-locale
+-w /etc/hostname -p wa -k system-locale
+-a always,exit -F dir=/etc/NetworkManager/ -F perm=wa -F key=system-locale
+-a always,exit -F dir=/etc/selinux/ -F perm=wa -F key=MAC-policy
+-a always,exit -F arch=b32 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=unset -F key=perm_mod
+-a always,exit -F arch=b64 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=unset -F key=perm_mod
+-a always,exit -F arch=b32 -S lchown,fchown,chown,fchownat -F auid>=1000 -F auid!=unset -F key=perm_mod
+-a always,exit -F arch=b64 -S chown,fchown,lchown,fchownat -F auid>=1000 -F auid!=unset -F key=perm_mod
+-a always,exit -F arch=b32 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=unset -F key=perm_mod
+-a always,exit -F arch=b64 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=unset -F key=perm_mod
+-a always,exit -F arch=b32 -S open,creat,truncate,ftruncate,openat,open_by_handle_at -F exit=-EACCES -F auid>=1000 -F auid!=unset -F key=access
+-a always,exit -F arch=b32 -S open,creat,truncate,ftruncate,openat,open_by_handle_at -F exit=-EPERM -F auid>=1000 -F auid!=unset -F key=access
+-a always,exit -F arch=b64 -S open,truncate,ftruncate,creat,openat,open_by_handle_at -F exit=-EACCES -F auid>=1000 -F auid!=unset -F key=access
+-a always,exit -F arch=b64 -S open,truncate,ftruncate,creat,openat,open_by_handle_at -F exit=-EPERM -F auid>=1000 -F auid!=unset -F key=access
+-a always,exit -F arch=b32 -S mount -F auid>=1000 -F auid!=unset -F key=export
+-a always,exit -F arch=b64 -S mount -F auid>=1000 -F auid!=unset -F key=export
+-a always,exit -F arch=b32 -S unlink,unlinkat,rename,renameat -F auid>=1000 -F auid!=unset -F key=delete
+-a always,exit -F arch=b64 -S unlink,unlinkat,rename,renameat -F auid>=1000 -F auid!=unset -F key=delete
+-w /etc/sudoers -p wa -k actions
+-w /etc/sudoers.d/ -p wa -k actions"
+
+## Main
+if [ -z "$1" ]; then
+    echo -n "The script is only used on RHEL7/CentOS7. Are you sure to config the OS? [yes/no]: "
+    read answer
+    if ! [ "$answer" == "yes" -o "$answer" == "y" ]; then
+        exit 1
+    fi
+elif [ "$1" != "yes" ]; then
+    echo "Please confirm to config the OS."
+    exit 1
+fi
+
+PATH=$PATH:/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+rhel_num=$(uname -r |sed -r -n 's/^.*el([[:digit:]]).*$/\1/p')
+# if [[ $rhel_num != [7-8] ]]; then
+#     echo -e "The script is only used on RHEL/CentOS 7 and 8."
+#     exit 1
+# fi
+select_yamtc_fab
+
+if [[ $rhel_num != [7] ]]; then
+    echo -e "The script is only used on RHEL7/CentOS7."
+    exit 1
+fi
+
+## Call Function
+create_user
+set_sudo
+#set_fstab
+disable_selinux
+set_runlevel # need reboot
+#disable_ipv6 # need reboot
+set_timezone
+set_chrony
+#enable_kdump # need reboot
+# set_cron_user
+set_cron_mail
+set_service
+set_ulimit
+set_sysctl
+set_password_age
+set_password_complex
+set_password_history
+set_password_faillock
+set_banner
+#set_umask
+set_ps1
+set_profile
+set_prompt_command
+set_sshd
+set_logrotate
+set_rsyslog
+#set_auditd
+#set_audit_rules
+set_yum
+disable_usb
+disable_ctrl_alt_del
+enable_network_lldp
+
