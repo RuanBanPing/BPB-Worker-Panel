@@ -9,3 +9,172 @@
 !src/
 !src/**
 !package.json
+
+
+1111111111-IP
+#!/bin/bash
+
+# ==============================================================================
+# 1. 原CentOS 7脚本
+# ==============================================================================
+run_centos7_script() {
+#hostnamectl set-hostname $1
+MODE=4
+Port1=$1
+Port2=$2
+IP_WITH_MASK=$3
+GW=$4
+
+IP=$(echo $IP_WITH_MASK | cut -d'/' -f1)
+PREFIX=$(echo $IP_WITH_MASK | cut -d'/' -f2)
+
+echo "DEVICE=bond0
+NAME=bond0
+TYPE=bond
+BONDING_MASTER=yes
+BONDING_OPTS=\"miimon=100 mode=$MODE\"
+ONBOOT=yes
+NM_CONTROLLED=no
+BOOTPROTO=none
+IPADDR=$IP
+PREFIX=$PREFIX
+DNS1=10.18.104.100
+DNS2=10.18.104.200
+GATEWAY=$GW" > /etc/sysconfig/network-scripts/ifcfg-bond0
+
+echo "DEVICE=$Port1
+ONBOOT=yes
+MASTER=bond0
+SLAVE=yes" > /etc/sysconfig/network-scripts/ifcfg-$Port1
+
+echo "DEVICE=$Port2
+ONBOOT=yes
+MASTER=bond0
+SLAVE=yes" > /etc/sysconfig/network-scripts/ifcfg-$Port2
+
+systemctl stop NetworkManager
+systemctl disable NetworkManager
+systemctl restart network
+}
+
+# ==============================================================================
+# 2. 原RedHat9脚本 
+# ==============================================================================
+run_rhel9_script() {
+echo "============ PermitRootLogin ============"
+echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
+systemctl restart sshd.service
+
+# 1. Check argument count
+if [ "$#" -ne 4 ]; then
+    echo "❌Error: Incorrect number of arguments!"
+    echo "💡Usage: sudo $0 <NIC1> <NIC2> <IP/CIDR> <GATEWAY>"
+    exit 1
+fi
+
+NIC1="$1"
+NIC2="$2"
+IP_CIDR="$3"
+GATEWAY="$4"
+BOND_NAME="bond0"
+
+# Fixed DNS server list
+DNS_SERVER="10.18.104.100,10.18.104.200"
+
+# 2. Check root privileges
+if [ "$EUID" -ne 0 ]; then
+    echo "❌ Error: Please run this script with root privileges or sudo!"
+    exit 1
+fi
+
+echo "1. Cleaning up legacy and conflicting connections..."
+nmcli connection show | grep -E "$NIC1|$NIC2|$BOND_NAME" | awk '{print $1}' | while read -r conn; do
+    if [ -n "$conn" ]; then
+        nmcli connection delete "$conn" > /dev/null 2>&1
+    fi
+done
+
+echo "2. Ensuring physical network devices are managed by NetworkManager..."
+sudo nmcli device set "$NIC1" managed yes > /dev/null 2>&1
+sudo nmcli device set "$NIC2" managed yes > /dev/null 2>&1
+
+echo "3. Creating Bond interface: $BOND_NAME (Mode 4 / 802.3ad)..."
+nmcli connection add type bond con-name "$BOND_NAME" ifname "$BOND_NAME" \
+    bond.options "mode=4,miimon=100,lacp_rate=fast,xmit_hash_policy=layer3+4" \
+    ipv4.method manual ipv4.addresses "$IP_CIDR" ipv4.gateway "$GATEWAY" \
+    ipv4.dns "$DNS_SERVER"
+
+echo "4. Adding physical interfaces as ports to the bond..."
+nmcli connection add type ethernet con-name "$NIC1" ifname "$NIC1" master "$BOND_NAME"
+nmcli connection add type ethernet con-name "$NIC2" ifname "$NIC2" master "$BOND_NAME"
+
+echo "5. Restarting NetworkManager to apply changes and activate bond..."
+sudo systemctl restart NetworkManager
+sleep 2
+sudo nmcli connection up "$BOND_NAME"
+
+echo "============ Configuration Completed! ============"
+echo "Current Bonding Status:"
+cat /proc/net/bonding/"$BOND_NAME" | grep -E "Bonding Mode|IEEE 802.3ad"
+
+sleep 10
+ping -c 3 "$GATEWAY"
+}
+
+
+# ==============================================================================
+# 3. 系统版本检测与调用逻辑
+# ==============================================================================
+
+# 基础检查
+if [ "$#" -lt 1 ]; then
+    echo "❌Error: Incorrect number of arguments!"
+    echo "💡Usage: sudo $0 <NIC1> <NIC2> <IP/CIDR> <GATEWAY>"
+    exit 1
+fi
+
+# 获取系统版本
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS_ID=$(echo "$ID" | tr '[:upper:]' '[:lower:]')
+    OS_VERSION="$VERSION_ID"
+else
+    echo "❌ Error: Unable to retrieve system version information（/etc/os-release）"
+    exit 1
+fi
+
+echo "=========================================="
+echo "Current OS: $OS_ID, Version: $OS_VERSION"
+echo "=========================================="
+
+# 根据系统运行对应脚本
+if [[ "$OS_ID" == "centos" && "$OS_VERSION" =~ ^7 ]]; then
+    echo "Matched with CentOS 7, Invoke:centos7_script..."
+    run_centos7_script "$@"
+
+elif [[ ("$OS_ID" == "rocky" && ("$OS_VERSION" == "8.10" || "$OS_VERSION" == "9.6")) || \
+       ("$OS_ID" == "rhel" && "$OS_VERSION" == "9.6") ]]; then
+    echo "Matched with$OS_ID $OS_VERSION, Invoke:rhel9_script..."
+    run_rhel9_script "$@"
+
+else
+    echo "❌ Error: Current OS ($OS_ID $OS_VERSION)Not in the supported list！"
+    echo "💡 Supports only：CentOS 7.x, Rocky 8.10, Rocky 9.6, RedHat 9.6"
+    exit 1
+fi
+
+
+
+
+22222222222222222-
+
+
+
+
+
+
+
+
+
+
+
